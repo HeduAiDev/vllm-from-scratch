@@ -2,13 +2,24 @@
 
 本仓库是《vLLM：从入门到专家》三篇博客的配套代码，所有实现均可在 vllm 容器中运行。
 
+## 博客文件（2.0 版为最新，带理论背景+架构图+源码分析）
+
+| 版本 | 文件 | 内容 |
+|------|------|------|
+| 2.0（推荐）| `BLOG_PART1_V2.md` | 第1-5章：架构、Paged Attention、KV Cache（含论文引用+架构图） |
+| 2.0（推荐）| `BLOG_PART2_V2.md` | 第6-10章：Prefix Cache、Scheduler、投机解码、Chunked Prefill |
+| 2.0（推荐）| `BLOG_PART3_V2.md` | 第11-15章：DeepSeek MoE、MLA、PD分离、V1架构、Mini vLLM |
+| 1.0 | `BLOG_PART1.md` | 第1-5章（精简版） |
+| 1.0 | `BLOG_PART2.md` | 第6-10章（精简版） |
+| 1.0 | `BLOG_PART3.md` | 第11-15章（精简版） |
+
 ## 目录结构
 
 ```
 vllm-from-scratch/
-├── BLOG_PART1.md          # 第1-5章：架构 + Paged Attention + KV Cache
-├── BLOG_PART2.md          # 第6-10章：Prefix Cache + Scheduler + 投机解码 + Chunked Prefill
-├── BLOG_PART3.md          # 第11-15章：DeepSeek MoE + MLA + PD分离 + 整合
+├── BLOG_PART1_V2.md       # [2.0] 第1-5章：架构 + Paged Attention + KV Cache
+├── BLOG_PART2_V2.md       # [2.0] 第6-10章：Prefix Cache + Scheduler + 投机解码 + Chunked Prefill
+├── BLOG_PART3_V2.md       # [2.0] 第11-15章：DeepSeek MoE + MLA + PD分离 + 整合
 │
 ├── 01_paged_attention/
 │   ├── paged_attention.py       # Paged Attention + Block Table 完整实现
@@ -63,8 +74,8 @@ docker exec vllm python3 /mnt/esfs/master_work/vllm-from-scratch/05_mini_vllm/mi
 | 第10章 | Chunked Prefill，混合批处理 | BLOG_PART2.md + `05_mini_vllm/mini_vllm.py` |
 | 第11章 | DeepSeek MoE，GroupedTopK路由 | `03_moe/mini_moe.py` |
 | 第12章 | MLA，低秩KV，解耦RoPE | `04_mla/mini_mla.py` |
-| 第13章 | PD 分离，KV Transfer | BLOG_PART3.md |
-| 第14章 | V1 引擎架构，全局视角 | BLOG_PART3.md |
+| 第13章 | PD 分离，KV Transfer | BLOG_PART3_V2.md + `06_global_prefix_cache/global_kv_pool.py` |
+| 第14章 | V1 引擎架构，全局视角 | BLOG_PART3_V2.md |
 | 第15章 | Mini vLLM 完整整合 | `05_mini_vllm/mini_vllm.py` |
 
 ## 关键数字
