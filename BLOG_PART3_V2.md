@@ -392,16 +392,34 @@ class GroupedTopKRouter(nn.Module):
 output = torch.zeros_like(x_flat)
 for expert_id in range(self.num_experts):
     expert_mask = (topk_ids == expert_id)     # [T, K] bool
+    # expert_mask[t, k] = True 表示：第 t 个 token 的第 k 个 top-k slot 路由到了 expert_id
+
     token_mask = expert_mask.any(dim=-1)       # [T] bool
+    # token_mask[t] = True 表示：第 t 个 token 有至少一个 top-k slot 路由到了 expert_id
     if not token_mask.any():
         continue
 
-    tokens = x_flat[token_mask]               # [M, D]
+    tokens = x_flat[token_mask]               # [M, D]，M = 路由到 expert_id 的 token 数
     expert_out = self.experts[expert_id](tokens)  # [M, D]
 
-    # 取该专家对应的路由权重
-    weights = topk_weights[token_mask][expert_mask[token_mask].int().argmax(dim=-1)]
+    # 取该专家对应的路由权重，需要 4 个步骤：
+    weights_for_tokens = topk_weights[token_mask]        # [M, K]：M 个 token 各自的 K 个权重
+    expert_weights_mask = expert_mask[token_mask]        # [M, K] bool：哪个 k-slot 对应 expert_id
+
+    # 例：token_i 的 top-2 专家是 [expert_3, expert_id]
+    #     expert_weights_mask[i] = [False, True]
+    #     .int()                 = [0, 1]
+    #     .argmax(dim=-1)        = 1           ← 对应 expert_id 的 k-slot 下标
+    first_match = expert_weights_mask.int().argmax(dim=-1)  # [M]，值域 [0, K-1]
+
+    # torch.arange(M) 配合 first_match 实现 2D gather：
+    # weights[i] = weights_for_tokens[i, first_match[i]]
+    # 即：取 token_i 在 expert_id 对应的那个 k-slot 的路由权重（标量）
+    M = tokens.shape[0]
+    weights = weights_for_tokens[torch.arange(M), first_match]  # [M]
+
     output[token_mask] += expert_out * weights.unsqueeze(-1)
+    # weights.unsqueeze(-1): [M] → [M, 1]，广播到 [M, D]
 ```
 
 > **注**：这是教学版实现（O(N_experts) kernel launch）。生产环境的 FusedMoE 用 Triton grouped GEMM，只需 O(1) 次 kernel。
@@ -538,6 +556,24 @@ Decode 阶段（每次生成 1 个 token）：
 ```
 
 #### 12.4.2 关键源码解析
+
+**关键设计问题：为什么 `kv_b_proj` 不提前在 KV Cache 写入前展开？**
+
+直觉上，我们可以在存入 KV Cache 前就调用 `kv_b_proj(c_kv)` 得到完整的 K、V，然后直接存储完整 K、V。但实际上 MLA 的存储策略是：
+
+```
+方案 A（天真方案）：提前展开，存完整 K/V
+  存储量 = num_heads × (nope_dim + v_dim) = 128 × (128+128) = 32768 fp16/token
+  ← 与 MHA 等价，KV 节省为零！
+
+方案 B（MLA 方案）：存 c_kv，计算时实时展开 kv_b_proj
+  存储量 = kv_lora_rank + rope_dim = 512 + 64 = 576 fp16/token
+  ← 节省 56.9x！
+```
+
+因此，**不提前展开是 MLA 节省 KV Cache 的根本原因**。代价是每次 Decode 步都要额外做一次 `kv_b_proj` 矩阵乘法（从历史 c_kv 恢复 K/V），这是计算量换内存的权衡。
+
+在 vLLM 的生产实现中，`kv_b_proj` 进一步被融合进 FlashAttention kernel（`MLACommonImpl`）：不需要先把完整 K/V 写出到 HBM，而是在 SRAM 内完成 `kv_b_proj` 后直接做 attention，进一步节省 HBM 带宽。
 
 ```python
 # vllm/model_executor/models/deepseek_v2.py
@@ -689,6 +725,39 @@ if T > 1:
     )
 ```
 
+**公式 `diagonal = S - T + 1` 的推导**：
+
+`torch.triu(matrix, diagonal=d)` 保留上三角（列 ≥ 行 + d 的元素），其余填零。
+
+我们用 `-inf` 填充整个矩阵再调 triu，效果是：
+- **保留（-inf）**：col ≥ row + d 的位置 → 这些位置被遮掩
+- **清零（0）**：col < row + d 的位置 → 这些位置可以 attend
+
+对于一个包含历史的序列：
+- Query 矩阵的行 i（0-indexed）对应序列中绝对位置 `(S - T + i)`
+- Key 矩阵的列 j（0-indexed）对应序列中绝对位置 `j`
+- 因果规则：位置 `(S-T+i)` 只能 attend 到 ≤ `(S-T+i)` 的位置
+  → 合法范围：col_j ≤ S-T+i，即 **col_j < row_i + (S-T+1)**
+  → 遮掩范围：col_j ≥ row_i + (S-T+1) → 正好是 `diagonal = S-T+1`
+
+**三种典型情况**：
+
+```
+情况1：纯 Prefill（无历史），S=T=8
+  diagonal = 8-8+1 = 1
+  标准下三角因果掩码（不含主对角线右侧）
+
+情况2：Prefill 含历史，S=20，T=4（前16 token是历史）
+  diagonal = 20-4+1 = 17
+  每行可 attend 的范围：
+    row_0（绝对位置16）→ col 0..16 可attend，col 17..19 遮掩
+    row_3（绝对位置19）→ col 0..19 全可attend（无需遮掩）
+
+情况3：单 Token Decode，S=20，T=1
+  if T > 1 条件不满足，跳过掩码计算
+  （单 token 无需因果掩码：它可以 attend 所有历史，没有"未来"）
+```
+
 #### 12.5.3 运行测试
 
 ```bash
@@ -797,44 +866,93 @@ RDMA One-sided READ 流程：
 
 #### 13.3.2 vLLM 的 KVConnector 接口
 
-vLLM V1 提供标准化的 KV 传输接口：
+vLLM V1 的 KVConnector 接口分为**调度器侧**和**Worker 侧**两部分，体现了 V1 引擎的多进程架构（调度器和 Worker 运行在不同进程中）：
 
 ```python
-# vllm/v1/worker/kv_connector_model_runner_mixin.py
-# 以及各具体实现
+# vllm/distributed/kv_transfer/kv_connector/v1/base.py
 
-class KVConnectorBase_V1:
+class KVConnectorBase_V1(ABC):
     """
-    KV Cache 传输抽象基类
+    KV Cache 传输抽象基类（V1 架构）
 
-    Prefill 节点（send side）：
-      1. 模型推理完成后，调用 send_kv_caches
-      2. 将计算好的 KV blocks 发送给 Decode 节点
-
-    Decode 节点（recv side）：
-      1. 在推理前，调用 recv_kv_caches
-      2. 等待 KV blocks 从 Prefill 节点到达
+    接口分两侧：
+    - Scheduler 侧：运行在调度器进程，负责元数据查询（"有多少 token 可以从远端 KV 加载？"）
+    - Worker 侧：运行在 GPU Worker 进程，负责实际 KV 数据的读写
     """
 
-    # Prefill 侧：推理完成后发送
-    def send_kv_caches_and_hidden_states(
-        self,
-        model_executable,
-        model_input,
-        kv_caches: list[torch.Tensor],
-        hidden_or_intermediate_states,
-    ) -> None: ...
+    # ─── Scheduler 侧（在 schedule() 时调用）───────────────────
 
-    # Decode 侧：推理前接收
-    def recv_kv_caches_and_hidden_states(
+    @abstractmethod
+    def get_num_new_matched_tokens(
         self,
-        model_executable,
-        model_input,
-        kv_caches: list[torch.Tensor],
-    ) -> tuple[torch.Tensor, bool]: ...
-    # 返回 (hidden_states, bypass_model)
-    # bypass_model=True 意味着直接跳过模型推理，用传来的 KV 做 decode
+        request: Request,
+        num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        """
+        查询：远端 KV Cache 中，超过本地已计算 num_computed_tokens 之后
+        还能额外提供多少 token 的 KV？
+
+        返回 (extra_tokens, is_async)：
+        - extra_tokens: 可从远端加载的额外 token 数（None 表示还不确定，调度器后续重试）
+        - is_async: True 表示 KV 将异步传输（下次调度时可能才就绪）
+        """
+        ...
+
+    @abstractmethod
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
+        """在 KV 块分配完成后更新 Connector 状态（记录需要填入哪些块）"""
+        ...
+
+    @abstractmethod
+    def request_finished(
+        self, request: Request, block_ids: tuple[list[int], ...]
+    ) -> tuple[bool, dict | None]:
+        """
+        请求完成时回调：可选择异步将 KV 发送给其他节点
+        返回 should_delay_free=True 则 Connector 接管块的释放时机
+        """
+        ...
+
+    # ─── Worker 侧（在 GPU 前向传播前后调用）──────────────────
+
+    @abstractmethod
+    def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
+        """
+        D-Node：在前向传播前，开始从远端拉取 KV（异步 RDMA READ）
+        此调用立即返回，不阻塞模型执行
+        """
+        ...
+
+    @abstractmethod
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        """
+        在 attention 层计算前，等待该层 KV 加载完成
+        支持逐层流水线：layer N 的 attention 计算时，layer N+1 的 KV 正在传输
+        """
+        ...
+
+    @abstractmethod
+    def save_kv_layer(
+        self, layer_name: str, kv_layer: torch.Tensor, attn_metadata, **kwargs
+    ) -> None:
+        """
+        P-Node：在 attention 层计算完成后，将本层 KV 发送出去（异步 RDMA WRITE）
+        此调用立即返回，不阻塞模型执行
+        """
+        ...
+
+    @abstractmethod
+    def wait_for_save(self):
+        """等待所有层的 KV 发送完成（在前向传播结束时调用）"""
+        ...
 ```
+
+**V1 接口设计要点**：
+- **逐层流水线**：`start_load_kv()` + `wait_for_layer_load()` 允许 KV 传输与模型计算重叠（每层 attention 等自己那层的 KV，而不是等所有层都就绪）
+- **调度器感知**：`get_num_new_matched_tokens()` 让调度器在分配 KV 块前就知道有多少 token 无需 Prefill，实现精确的 token budget 管理
+- **异步发送**：`save_kv_layer()` 在 P-Node 每层 attention 后立刻异步发送，而不是等全部层 Prefill 完成后才开始传输，显著降低 D-Node 等待时间
 
 #### 13.3.3 Mooncake 实现（基于 RDMA 的高速传输）
 
@@ -1174,32 +1292,42 @@ EngineCore（独立进程）
 #### 14.3.1 Scheduler（调度器）
 
 ```
-Scheduler 状态机：
+Scheduler 状态机（vLLM V1 默认行为）：
 
   新请求 → [waiting 队列]
                │
-               │ (有足够 KV blocks)
+               │ (分配到足够 KV blocks)
                ▼
            [running 队列]  ←── decode 步持续在此
                │
                │ (KV blocks 不足，发生抢占)
                ▼
-           [preempted 队列] → swap-out KV 到 CPU
-               │
-               │ (CPU 内存有空间时)
-               ▼
-           [swapped 队列]
-               │
-               │ (GPU 内存释放后，swap-in)
-               ▼
-           [running 队列]
+           ╔════════════════════════════════════╗
+           ║  抢占策略（preemption_mode）        ║
+           ║                                    ║
+           ║  V1 默认：RECOMPUTE（重算）          ║
+           ║    → 释放该请求的所有 KV blocks       ║
+           ║    → 请求退回 [waiting 队列]          ║
+           ║    → 等 GPU 内存空闲后重新 Prefill     ║
+           ║                                    ║
+           ║  可选：SWAP（换出）                  ║
+           ║    → KV blocks swap-out 到 CPU 内存  ║
+           ║    → 请求进入 [swapped 队列]          ║
+           ║    → GPU 内存释放后 swap-in 恢复       ║
+           ╚════════════════════════════════════╝
+
+说明：
+  - V1 默认 RECOMPUTE：实现最简单，无需管理 CPU KV Buffer，
+    通常 GPU 内存富裕时抢占概率很低，重算代价可接受
+  - SWAP 适合：长 prompt 抢占代价高（重算 2000 token > swap 4MB）、
+    CPU 内存充裕的场景；vLLM 通过 --preemption-mode=swap 开启
 
 关键配置路径：
   vllm/v1/core/sched/scheduler.py
-    ├── Scheduler.schedule()         # 主调度逻辑
-    ├── _schedule_prefills()          # Chunked Prefill 处理
-    ├── _schedule_running()           # Decode 请求管理
-    └── _preempt()                    # 抢占逻辑
+    ├── Scheduler.schedule()          # 主调度逻辑（先 decode，再 prefill）
+    ├── _schedule_prefills()           # Chunked Prefill 处理
+    ├── _schedule_running()            # Decode 请求管理
+    └── _preempt()                     # 抢占逻辑（默认 RECOMPUTE）
 ```
 
 #### 14.3.2 CUDA Graph 加速

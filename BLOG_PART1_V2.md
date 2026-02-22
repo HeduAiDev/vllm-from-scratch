@@ -344,109 +344,211 @@ self.kv_caches = [
 
 #### 3.2.2 Block Table 的数据结构
 
-每个请求维护一个 block_table，记录逻辑块 → 物理块的映射：
+**Block Table 是什么**：每个请求维护一张表，记录"逻辑块编号 → 物理块 ID"的映射。可以把它理解为一个数组，下标是逻辑块索引（0, 1, 2, ...），值是对应的物理块 ID。
 
 ```
-请求 A（prompt 40 tokens，block_size=16）：
+请求 A（已处理 40 tokens，block_size=16）：
 
-逻辑块0（token 0-15）  →  物理块 ID=7
-逻辑块1（token 16-31） →  物理块 ID=23
-逻辑块2（token 32-47） →  物理块 ID=4（可能部分填充）
+逻辑块0  覆盖 token  0-15  →  物理块 ID = 7
+逻辑块1  覆盖 token 16-31  →  物理块 ID = 23
+逻辑块2  覆盖 token 32-47  →  物理块 ID = 4（仅使用了前8个slot，部分填充）
 
 block_table[A] = [7, 23, 4]
-
-内存访问时：
-  token_at_position_18 的 K 存储位置
-  = k_cache[physical_block_id][offset_in_block][head][dim]
-  = k_cache[23][18-16][head][dim]
-  = k_cache[23][2][head][dim]
+                  ↑   ↑   ↑
+               逻辑块0 1  2
 ```
 
-**关键源码**（`vllm/v1/core/kv_cache_manager.py`）：
+**如何用 block_table 定位某个 token 的 K/V**：
+
+```
+问题：token 18 的 K 存在哪里？
+
+Step 1: 计算逻辑块索引  block_idx    = 18 // 16 = 1
+Step 2: 计算块内偏移    block_offset = 18 %  16 = 2
+Step 3: 查 block_table  physical_block_id = block_table[1] = 23
+Step 4: 访问物理存储    k_cache[23][2][head][dim]
+                          ↑     ↑
+                    物理块ID  块内偏移
+```
+
+**Block Table 在推理中的两个用途**：
+
+```
+用途1（写入）：Prefill/Decode 时，把计算好的 K,V 写入 KV Cache
+  → 需要知道"每个新 token 写到哪个物理 slot"
+  → 由此派生出 Slot Mapping（见下节）
+
+用途2（读取）：Decode 时，读取所有历史 token 的 K,V 做 attention
+  → GPU Kernel 遍历 block_table，依次读取每个物理块
+  → 由此实现非连续物理内存的"连续"访问
+```
+
+**Block Table 的内存布局**（实际 vLLM 中是一个 2D tensor）：
+
+```
+block_tables: [max_num_seqs, max_num_blocks_per_seq]  （整型 tensor，在 GPU 上）
+
+例：batch 中有 3 个请求，max_blocks=8，block_size=16
+  row 0 (请求A): [7, 23,  4,  0,  0, ...]   ← 只用了3个逻辑块，其余填0
+  row 1 (请求B): [2,  0,  0,  0,  0, ...]   ← 只用了1个逻辑块
+  row 2 (请求C): [9, 15, 31, 44,  0, ...]   ← 用了4个逻辑块
+```
+
+**vLLM 源码位置**（`vllm/v1/worker/block_table.py`，`vllm/v1/core/kv_cache_manager.py`）：
 
 ```python
+# vllm/v1/core/kv_cache_manager.py（简化）
 class KVCacheManager:
     def allocate_slots(
         self,
         request: Request,
-        num_new_tokens: int,
+        num_new_tokens: int,      # 本次调度步骤要处理的 token 数
         ...
-    ) -> list[int]:
+    ) -> list[int] | None:
         """
-        为一个请求分配新的 KV Cache 槽位
-        返回 slot_mapping：每个新 token 在 KV Cache 中的线性槽位号
+        功能：为请求分配足够的物理块，并返回 slot_mapping。
+
+        参数说明：
+          request.num_computed_tokens：
+              该请求到目前为止已经完成计算并写入 KV Cache 的 token 数。
+              - 首次 Prefill 前：= 0（或 prefix cache 命中的 token 数）
+              - 每次 schedule 完成后：由 update_from_output() 递增
+              例：prompt 有 40 tokens，首次 Prefill 全量计算后 = 40
+
+          num_new_tokens：
+              本次调度要新计算的 token 数。
+              - Prefill 步：= prompt 长度（或 chunked prefill 的 chunk 大小）
+              - Decode 步：= 1（每次只生成 1 个 token）
         """
-        # 计算需要多少个新块
+        # current_end：本次计算完成后，序列的总 token 数
+        # 含义：从位置 0 到 current_end-1，这些 token 都需要在 KV Cache 中有对应 slot
+        # 示例：num_computed=32, num_new=8 → current_end=40
+        #        意味着 token 0-39 都需要 slot，需要 ceil(40/16)=3 个物理块
         current_end = request.num_computed_tokens + num_new_tokens
         num_blocks_needed = math.ceil(current_end / self.block_size)
 
-        # 分配新块
+        # 按需分配新块（已有的块不重复分配）
+        # 例：已有 2 个块，需要 3 个 → 只分配第 3 个
         while len(request.block_ids) < num_blocks_needed:
             block_id = self._allocator.allocate()
             request.block_ids.append(block_id)
+        # 此时 request.block_ids 就是 block_table：逻辑块索引 → 物理块 ID
 
-        # 计算每个 token 的 slot
+        # 计算 slot_mapping：每个"新 token"写入哪个物理 slot
+        # 只需为本次新增的 token（位置 num_computed 到 current_end-1）计算
         slot_mapping = []
-        for i, pos in enumerate(range(request.num_computed_tokens,
-                                      request.num_computed_tokens + num_new_tokens)):
-            block_idx = pos // self.block_size
-            block_offset = pos % self.block_size
-            physical_block = request.block_ids[block_idx]
+        for pos in range(request.num_computed_tokens, current_end):
+            block_idx        = pos // self.block_size       # 逻辑块索引
+            block_offset     = pos %  self.block_size       # 块内偏移
+            physical_block   = request.block_ids[block_idx] # 查 block_table
             slot = physical_block * self.block_size + block_offset
             slot_mapping.append(slot)
 
         return slot_mapping
 ```
 
-#### 3.2.3 Paged Attention 的计算过程
+#### 3.2.3 Slot Mapping：Block Table 的"写入视图"
 
-在 **Decode** 阶段（每次只有 1 个新 token），计算该 token 对所有历史 token 的 attention：
+Block Table 回答的是"读取"问题：Decode 时，历史 K/V 在哪些物理块？
 
-```
-Decode Attention 的计算流程：
-
-┌─────────────────────────────────────────────────────┐
-│  新 token 的 Q: shape [1, num_heads, head_dim]       │
-│                                                     │
-│  历史 K, V 分散存储在多个物理块中：                 │
-│                                                     │
-│  Block 7: K[0..15], V[0..15]    （token 0-15）      │
-│  Block 23: K[16..31], V[16..31]  （token 16-31）    │
-│  Block 4: K[32..39], V[32..39]  （token 32-39，部分）│
-│                                                     │
-│  Paged Attention Kernel：                           │
-│  ├── 遍历 block_table 中每个物理块                  │
-│  ├── 从物理块读取 K, V                              │
-│  ├── 计算 Q·K^T / sqrt(d_k)                        │
-│  ├── softmax（跨所有块累积）                         │
-│  └── 加权求和 V                                     │
-│                                                     │
-│  输出：[1, num_heads, head_dim]                     │
-└─────────────────────────────────────────────────────┘
-```
-
-vLLM 使用 **FlashAttention** + 自定义 **Paged Attention Kernel**（`vllm/_custom_ops.py`）实现这一计算。核心 CUDA Kernel 位于 `vllm/csrc/attention/attention_kernels.cuh`。
-
-#### 3.2.4 Slot Mapping：连接调度和计算的关键
-
-`slot_mapping` 是 Scheduler 和 GPU Kernel 之间传递 KV 位置信息的核心数据结构：
+**Slot Mapping** 回答的是"写入"问题：本次前向传播计算出来的新 K/V，应该写到 KV Cache 的哪个线性位置？
 
 ```
-调度器计算 slot_mapping：
+为什么需要从 Block Table 派生出 Slot Mapping？
 
-  batch 中有 3 个请求：
-    请求A (prefill, 5 tokens):  slots = [0,1,2,3,4]     (在 block 0 中)
-    请求B (decode,  1 token):   slots = [128]            (在 block 8 中)
-    请求C (prefill, 3 tokens):  slots = [16,17,18]       (在 block 1 中)
+GPU Kernel 写 KV Cache 时，需要：
+  flat_k[slot] = computed_key    ← 一次性批量写入，slot 必须是标量整数
 
-  拼接后传给 GPU：
-    slot_mapping = [0,1,2,3,4, 128, 16,17,18]
-    token_ids    = [A0,A1,A2,A3,A4, B0, C0,C1,C2]
+而 Block Table 是"逻辑块 → 物理块"的二维映射，不能直接作为写地址。
 
-GPU Kernel 根据 slot_mapping 将计算好的 K, V 写入正确位置：
-    k_cache_flat[slot_mapping[i]] = computed_key[i]
-    v_cache_flat[slot_mapping[i]] = computed_value[i]
+Slot Mapping 是将 Block Table 展开得到的线性地址：
+  slot = physical_block_id × block_size + offset_in_block
+
+              Block Table（二维逻辑）        Slot Mapping（一维线性）
+  token 0  : block_table[0]=7, offset=0  →  slot =  7×16 + 0 = 112
+  token 1  : block_table[0]=7, offset=1  →  slot =  7×16 + 1 = 113
+  ...
+  token 16 : block_table[1]=23, offset=0 →  slot = 23×16 + 0 = 368
+  token 17 : block_table[1]=23, offset=1 →  slot = 23×16 + 1 = 369
 ```
+
+**Slot Mapping 在批处理中的使用**：
+
+Scheduler 为本批次中所有请求的新 token 计算 slot_mapping，拼接成一个大数组传给 GPU：
+
+```
+批次示例（block_size=16）：
+
+  请求A（Prefill，5 个新 token，已有 0 个 token，block_table=[0]）：
+    token  0 → slot  0×16+0 =  0
+    token  1 → slot  0×16+1 =  1
+    token  2 → slot  0×16+2 =  2
+    token  3 → slot  0×16+3 =  3
+    token  4 → slot  0×16+4 =  4
+    slots_A = [0, 1, 2, 3, 4]
+
+  请求B（Decode，1 个新 token，已有 128 个 token，block_table=[..., 8]）：
+    token 128 → slot  8×16+0 = 128
+    slots_B = [128]
+
+  请求C（Prefill，3 个新 token，已有 0 个 token，block_table=[1]）：
+    token  0 → slot  1×16+0 = 16
+    token  1 → slot  1×16+1 = 17
+    token  2 → slot  1×16+2 = 18
+    slots_C = [16, 17, 18]
+
+  拼接传给 GPU：
+    token_ids    = [A0, A1, A2, A3, A4,  B0,  C0, C1, C2]
+    slot_mapping = [ 0,  1,  2,  3,  4, 128,  16, 17, 18]
+
+GPU Kernel 执行：
+    for i in range(len(token_ids)):
+        flat_k[slot_mapping[i]] = compute_key(token_ids[i], ...)
+        flat_v[slot_mapping[i]] = compute_val(token_ids[i], ...)
+```
+
+**Block Table vs Slot Mapping 的职责分工总结**：
+
+```
+                  Block Table                  Slot Mapping
+─────────────────────────────────────────────────────────────
+形式       逻辑块索引 → 物理块ID（2D）      token → 线性 slot（1D）
+谁计算     Scheduler（按需分配块时构建）    Scheduler（从 block_table 派生）
+谁使用     Decode Attention Kernel（读 KV） Write Kernel（写 KV）
+何时用     读取历史 KV（Decode 阶段）       写入新 KV（Prefill/Decode 均需）
+GPU 上形式 block_tables tensor             slot_mapping tensor
+─────────────────────────────────────────────────────────────
+```
+
+#### 3.2.4 Paged Attention 的计算过程
+
+在 **Decode** 阶段，GPU Kernel 通过 block_table 读取历史 K,V 并计算 attention：
+
+```
+Decode Attention（请求A，已有 40 tokens，block_table=[7, 23, 4]）：
+
+  新 token 的 Q: shape [1, num_heads, head_dim]
+
+  Kernel 遍历 block_table，读取所有历史 K, V：
+  ┌──────────────────────────────────────────────────────────┐
+  │  物理块 7  (逻辑块0): K[0..15], V[0..15]   → token 0-15  │
+  │  物理块 23 (逻辑块1): K[0..15], V[0..15]   → token 16-31 │
+  │  物理块 4  (逻辑块2): K[0..7],  V[0..7]    → token 32-39 │
+  └──────────────────────────────────────────────────────────┘
+         ↓                    ↓
+  Q·K^T / sqrt(d_k)    softmax（跨所有块累积）    加权求和 V
+         ↓
+  输出：[1, num_heads, head_dim]
+
+注意：物理块 7, 23, 4 在 GPU 显存中可能不连续，
+      Kernel 通过 block_table 逐块读取，
+      这就是"Paged Attention"名字的由来。
+```
+
+vLLM 使用 **FlashAttention** + 自定义 **Paged Attention Kernel** 实现这一计算：
+- 核心 CUDA Kernel：`vllm/csrc/attention/attention_kernels.cuh`
+- Python 接口：`vllm/_custom_ops.py`
+- 实际调用路径：`gpu_model_runner.py → attention backend → flash_attn_varlen_func / paged_attn_kernel`
 
 ### 3.3 从零实现：Paged Attention
 

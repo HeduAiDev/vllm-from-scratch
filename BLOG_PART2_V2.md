@@ -541,7 +541,34 @@ vLLM Scheduler 状态机：
   [FINISHED]───────────→ 释放 KV Cache 块
 ```
 
-#### 8.2.2 调度主循环（核心逻辑）
+#### 8.2.2 请求的阶段状态
+
+每个 Request 对象维护以下关键字段，决定它当前处于哪个阶段：
+
+```python
+class Request:
+    num_prompt_tokens: int      # prompt 的总 token 数（固定不变）
+    num_computed_tokens: int    # 已经完成计算并写入 KV Cache 的 token 数
+                                # 初始=0（或 prefix cache 命中数）
+                                # 每步 update_from_output 后递增
+
+    # 判断阶段：
+    @property
+    def is_prefill(self) -> bool:
+        # 还有未计算的 prompt token → 仍在 Prefill 阶段
+        return self.num_computed_tokens < self.num_prompt_tokens
+
+    @property
+    def remaining_prefill_tokens(self) -> int:
+        # 剩余需要计算的 prompt token 数（用于 Chunked Prefill）
+        return self.num_prompt_tokens - self.num_computed_tokens
+```
+
+关键逻辑：
+- `num_computed_tokens < num_prompt_tokens` → **Prefill 阶段**（可能因 Chunked Prefill 需要多步）
+- `num_computed_tokens == num_prompt_tokens` → **Decode 阶段**（开始逐 token 生成）
+
+#### 8.2.3 调度主循环（核心逻辑）
 
 **关键源码**（`vllm/v1/core/sched/scheduler.py`，简化版）：
 
@@ -550,37 +577,39 @@ def schedule(self) -> SchedulerOutput:
     """
     每步推理的调度决策
 
-    优先级顺序：
-    1. RUNNING 中的 Decode 请求（已有 KV Cache，代价最低）
-    2. RUNNING 中的 Prefill 请求（Chunked Prefill 的后续块）
-    3. WAITING 中的新请求（按 FCFS 顺序）
+    优先级顺序（为什么这样排？）：
+    1. RUNNING 中的 Decode 请求（每个只消耗 1 token budget，且已有完整 KV Cache，
+       不调度会造成 KV Cache 闲置浪费，优先级最高）
+    2. RUNNING 中的 Prefill 请求（Chunked Prefill 的后续 chunk，
+       这些请求已经占用了 KV Cache 块，需要尽快完成 prefill）
+    3. WAITING 中的新请求（按 FCFS 顺序，需要分配新的 KV Cache 块）
     """
     token_budget = self.scheduler_config.max_num_batched_tokens
+    # token_budget：本步最多处理多少 token（跨所有请求）
     scheduled: list[ScheduledRequest] = []
 
-    # Phase 1: 调度 Decode 请求（每个只需 1 token）
+    # Phase 1: 调度已在 running 的 Decode 请求（每个恰好消耗 1 token）
     for req in self.running:
-        if req.is_decode_mode:
+        if not req.is_prefill:  # 已完成 prefill → decode 模式
             if token_budget >= 1 and self._can_allocate_new_slot(req):
                 scheduled.append(ScheduledRequest(req, num_tokens=1))
                 token_budget -= 1
 
-    # Phase 2: 调度 Prefill 请求（Chunked Prefill）
+    # Phase 2: 调度 running 中还在 Prefill 的请求（Chunked Prefill 后续 chunk）
     for req in self.running:
-        if req.is_prefill_mode:
-            chunk = min(
-                req.remaining_prefill_tokens,  # 剩余未计算的 prompt tokens
-                token_budget,
-            )
+        if req.is_prefill:
+            # chunk 大小 = min(剩余未算的 prompt token 数, 剩余 token budget)
+            chunk = min(req.remaining_prefill_tokens, token_budget)
             if chunk > 0 and self._can_allocate_slots(req, chunk):
                 scheduled.append(ScheduledRequest(req, num_tokens=chunk))
                 token_budget -= chunk
 
-    # Phase 3: 从 waiting 队列补充新请求
+    # Phase 3: 从 waiting 队列补充新请求（FCFS，按到达先后）
     for req in self.waiting:
         if token_budget <= 0 or len(scheduled) >= self.max_num_seqs:
             break
-        chunk = min(req.prompt_len, token_budget)
+        # 新请求的第一个 chunk（可能是全量 prefill，也可能只是第一块）
+        chunk = min(req.num_prompt_tokens, token_budget)
         if self._can_allocate_slots(req, chunk):
             scheduled.append(ScheduledRequest(req, num_tokens=chunk))
             token_budget -= chunk
@@ -823,7 +852,7 @@ Tree Attention：
 
 ### 9.3 从零实现：投机解码
 
-> 完整代码：`02_kvcache/` 目录包含相关概念；投机解码简化版见 `BLOG_PART2.md` 第九章代码
+> 以下代码是独立的教学实现，无外部依赖。完整的投机解码与 Scheduler 集成见第15章及 `05_mini_vllm/mini_vllm.py`。
 
 **关键实现：Rejection Sampling**
 
@@ -1000,21 +1029,48 @@ class SchedulerConfig:
     enable_chunked_prefill: bool = True
 ```
 
-**调度器中的 is_prefill_chunk 标志**：
+**调度器状态更新**：
+
+每步推理完成后，`update_from_output` 更新每个请求的计算进度：
 
 ```python
 # scheduler.py 中的关键逻辑
 def update_from_output(self, output: ModelRunnerOutput):
     for req_id, num_tokens in output.num_computed_tokens.items():
         req = self.requests[req_id]
+
+        # num_computed_tokens：累加本步完成的 token 数
+        # 例：prompt=4096, chunk_size=2048
+        #   step1 完成后：num_computed_tokens = 2048
+        #   step2 完成后：num_computed_tokens = 4096 → prefill 完成
         req.num_computed_tokens += num_tokens
 
-        # is_prefill_chunk：还有未处理的 prompt token 吗？
-        req.is_prefill_chunk = (
-            req.num_computed_tokens < req.num_prompt_tokens
-        )
-        # True：下一步继续 prefill 下一个 chunk
-        # False：prefill 完成，下一步开始 decode
+        # 判断 prefill 是否完成：
+        # num_computed_tokens < num_prompt_tokens → 还有剩余 chunk，继续 prefill
+        # num_computed_tokens == num_prompt_tokens → prefill 完毕，切换到 decode
+        # （实际 vLLM 不维护独立的 is_prefill_chunk 字段，
+        #  而是每次 schedule 时通过 is_prefill 属性实时判断）
+```
+
+**配置参数含义**：
+
+```python
+@dataclass
+class SchedulerConfig:
+    max_num_batched_tokens: int = 32768
+    # 每步最多处理的 token 总数（跨所有请求）
+    # 值越大，GPU 利用率越高；值越小，Decode 请求等待越短
+
+    max_num_partial_prefills: int = 1
+    # 同时允许处于 chunked prefill 中间状态的请求数
+    # =1 表示同一时刻只有 1 个请求在分块 prefill（其余等待）
+    # >1 可以并行多个长 prompt，但每个的 chunk 更小
+
+    long_prefill_token_threshold: int = 0
+    # 超过此长度才拆分 chunk；= 0 表示对所有请求都分块
+    # > 0 则只对超长请求分块，短请求仍然一次性 prefill
+
+    enable_chunked_prefill: bool = True
 ```
 
 ### 10.4 从零实现：Chunked Prefill 调度器
