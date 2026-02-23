@@ -143,40 +143,452 @@ Step 4: 调度器报告
   → GPU 只做 16 token 的 Prefill，节省 32 token 的计算！
 ```
 
-### 6.4 从零实现：带 LRU 的 Prefix Cache
+### 6.3.3 深入理解：四个关键问题
+
+#### Q1：一个请求的生命周期中，block 什么时候被 free，什么时候开始驱逐？
+
+Block 的生命周期分为四个阶段：
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │          Block 状态机                    │
+                    │                                         │
+  初始化 →  [FREE]  ──── get_new_blocks() ──→  [ACTIVE]       │
+              │                                    │          │
+              │ 位于 free_block_queue               │          │
+              │ ref_cnt = 0                        │          │
+              │                                    │ ref_cnt > 0
+              │ ← free_blocks() 归零时 ─────────── ┘          │
+              │                                              │
+              ├─ 空间充裕：留在队列等待复用（Prefix Cache）     │
+              │                                              │
+              └─ 空间不足：被 popleft() 驱逐 ─→  [EVICTED]    │
+                   ↑                              从 cached_blocks 删除 hash
+                   └─── 分配给新请求 ─────────── [ACTIVE]     │
+                                                              │
+                    └─────────────────────────────────────────┘
+```
+
+**完整时序示例**（block_size=16, 系统总共10个块）：
+
+```
+t=0: 系统启动，10个块全在 free_block_queue
+     [B0, B1, B2, B3, B4, B5, B6, B7, B8, B9]（从左到右：最旧→最新）
+
+t=1: 请求A到达（32 token 系统提示词 + 16 token 用户问题 = 3个块）
+     get_new_blocks(3) → 弹出 B0, B1, B2
+     B0.ref_cnt = B1.ref_cnt = B2.ref_cnt = 1
+     free_block_queue: [B3, B4, B5, B6, B7, B8, B9]
+
+t=2: A的Prefill完成，cache_full_blocks()把满块登记入缓存
+     B0.block_hash = H0, B1.block_hash = H1（B2未满，不缓存）
+     cached_blocks: { H0 → B0, H1 → B1 }
+
+t=3: 请求B到达（相同系统提示词 + 不同用户问题）
+     touch([B0, B1])  → B0.ref_cnt: 1→2, B1.ref_cnt: 1→2（命中！）
+     get_new_blocks(1) → 弹出 B3 给B的用户问题
+     B3.ref_cnt = 1
+
+t=4: 请求A完成，free_blocks([B0, B1, B2])
+     B0.ref_cnt: 2→1（还有B共享，不入队）
+     B1.ref_cnt: 2→1（同上）
+     B2.ref_cnt: 1→0 → 加入 free_block_queue 尾部
+     free_block_queue: [B4, B5, B6, B7, B8, B9, B2]
+
+t=5: 请求B完成，free_blocks([B0, B1, B3])
+     B0.ref_cnt: 1→0 → 加入 free_block_queue 尾部（有 hash H0）
+     B1.ref_cnt: 1→0 → 加入 free_block_queue 尾部（有 hash H1）
+     B3.ref_cnt: 1→0 → 加入 free_block_queue 尾部（无 hash）
+     free_block_queue: [B4, B5, B6, B7, B8, B9, B2, B0, B1, B3]
+     cached_blocks: { H0 → B0, H1 → B1 }  ← 仍然有效！
+
+t=6: 请求C到达（需要5个新块，但只有6个空闲：B4-B9,B2,B0,B1,B3）
+     get_new_blocks(5)：弹出 B4, B5, B6, B7, B8
+     B4-B8 均无 hash，直接分配
+     驱逐触发（如 free_block_queue 已剩 B9,B2,B0,B1,B3 共5块）
+
+t=7: 请求D需要更多块，触发驱逐
+     popleft() → B9（最旧，无 hash） → 直接复用
+     popleft() → B2（次旧，无 hash） → 直接复用
+     popleft() → B0（有 hash H0）：
+         _maybe_evict_cached_block(B0) → 删除 cached_blocks[H0]
+         B0 现在可以被新请求使用（H0 的 KV 数据被覆盖）
+```
+
+**关键结论**：
+- `ref_cnt > 0`：块正被请求使用，**不能**被驱逐
+- `ref_cnt == 0`：块在 LRU 队列中，**等待**复用，暂时保留（Prefix Cache）
+- 驱逐**不是主动**触发的：当 `get_new_blocks()` 被调用且队列中有旧块时，旧块被弹出覆盖
+
+#### Q2：链式哈希会出现前面的 block 被驱逐而后面没有的情况吗？
+
+**会！** 这是 LRU 策略的已知代价，称为"孤儿块"（orphaned block）问题：
+
+```
+场景：100 个块的池，缓存了一个 3 块的系统提示词 [H0→B3, H1→B7, H2→B12]
+
+假设系统负载很高，驱逐顺序取决于 LRU 时间戳（而非哈希链顺序）
+
+可能的驱逐顺序：
+  B3 (H0) 最旧 → 被驱逐
+  cached_blocks 变为：{ H1 → B7, H2 → B12 }
+
+新请求 E 到达（相同系统提示词）：
+  query: H0 → MISS → break！
+  返回 0 个命中块
+
+  H1 → B7 和 H2 → B12 虽然还在缓存中，但永远不会被匹配到！
+  它们成为"孤儿块"：占用 KV Cache 空间，却永远不能被复用
+```
+
+**为什么 vLLM 接受这个设计缺陷？**
+
+1. **简单性**：LRU 是 O(1) 的全局策略，不需要追踪块之间的链式依赖
+2. **自然修复**：孤儿块也会被 LRU 驱逐（它们的访问时间早于新块），最终被清理
+3. **低概率**：热门前缀（如系统提示词）会被频繁访问，访问时间会刷新，不容易被驱逐
+4. **正确性不受影响**：孤儿块只是浪费空间，不会导致计算错误
+
+**改进方案**（vLLM 未实现但理论上可行）：
+- "链式驱逐"：驱逐 H0 时，同时驱逐所有以 H0 为祖先的块（H1, H2）
+- 代价：需要维护反向索引（parent_hash → [child_hashes]），增加复杂度
+
+#### Q3：为什么必须从头匹配前缀，不能从后往前找第一个命中？
+
+这是**物理约束**，不只是算法选择：
+
+```
+场景：tokens = [SYS_0..SYS_15 | SYS_16..SYS_31 | Q_0..Q_15]
+     缓存状态：H0 被驱逐（B0 已被覆盖），H1 和 H2 还在缓存
+
+如果我们"跳过 H0 miss，直接使用 H1"：
+
+  GPU 的 KV Cache：
+    Block H1（B7）：包含 positions 16-31 的 K/V 向量
+    Block H2（B12）：包含 positions 32-47 的 K/V 向量
+
+  现在处理 position 32（Q_0）的 attention：
+    需要 attend 到 positions 0..31 的 K/V
+    positions 16-31 → B7 可用 ✓
+    positions 0-15  → ??? KV 不在 GPU 内存中！
+
+    → attention 结果错误（未 attend 到所有历史 token）
+    → 或者 GPU 访问非法内存地址，直接崩溃
+```
+
+更深层原因：**KV 的语义是注意力上下文，而非孤立的向量**
+
+```python
+# attention 计算时 GPU 需要访问连续的 KV 块
+for pos in range(0, seq_len):
+    attn_score = Q[pos] @ K[0:pos]   # 必须有 0..pos-1 的全部 K
+    output[pos] = softmax(attn_score) @ V[0:pos]  # 必须有 0..pos-1 的全部 V
+
+# 如果 K[0:16] 不在 GPU 内存中，这段代码的结果是错的！
+# block table 必须提供 0..seq_len-1 的连续物理块地址
+```
+
+**链式哈希确保的是 token 身份（内容正确性）**，而不是 GPU 内存可用性。即使 H1 block 在哈希表中存在（意味着它保存的确实是 SYS_16..SYS_31 的 KV），但如果 H0 block 不在 GPU 内存中，attention 运算就无法正确执行。
+
+因此：
+
+```python
+# 正确的匹配逻辑（vLLM 的做法）
+matched = []
+for h in block_hashes:
+    if h in cached_blocks:
+        matched.append(cached_blocks[h])
+    else:
+        break  # 必须停在第一个 miss！后面的 block 即使命中也无法使用
+
+# 错误的逻辑（假设的"从后往前"，结果是错的）
+for h in reversed(block_hashes):    # ← 永远不能这样做！
+    if h in cached_blocks:
+        return cached_blocks[h]     # 孤立使用后续 block，attention 结果错误
+```
+
+#### Q4：KV Cache 在 TP/PP 并行时如何存储？对 Mooncake 有什么影响？
+
+**Tensor Parallelism（TP）的影响**：
+
+```
+TP=4 的 LLaMA-70B（128个 attention head）：
+
+  GPU_0：负责 head 0-31 的 Q/K/V 计算
+  GPU_1：负责 head 32-63 的 Q/K/V 计算
+  GPU_2：负责 head 64-95 的 Q/K/V 计算
+  GPU_3：负责 head 96-127 的 Q/K/V 计算
+
+每个 GPU 的 KV Cache 块布局：
+  kv_cache[block_id, :, head_start:head_end, :] = 该GPU负责的头的 KV
+
+同一个逻辑 block_id 在4个 GPU 上各有一片物理内存：
+  Block #7 on GPU_0: positions 0-15, heads 0-31
+  Block #7 on GPU_1: positions 0-15, heads 32-63
+  Block #7 on GPU_2: positions 0-15, heads 64-95
+  Block #7 on GPU_3: positions 0-15, heads 96-127
+
+Block table 是全局共享的（所有 GPU 上相同的 block_id）
+实际 KV 数据分布在 4 张 GPU 上
+```
+
+**TP 对 Mooncake 全局池化的约束**：
+
+```
+P 节点（TP=4）→ D 节点（TP=4）：
+  P.GPU_0 → 通过 RDMA WRITE → D.GPU_0（head 0-31）
+  P.GPU_1 → 通过 RDMA WRITE → D.GPU_1（head 32-63）
+  P.GPU_2 → 通过 RDMA WRITE → D.GPU_2（head 64-95）
+  P.GPU_3 → 通过 RDMA WRITE → D.GPU_3（head 96-127）
+  共 4 个并行 RDMA 传输
+
+当前限制（Mooncake Connector 源码中明确）：
+  - P.TP_size == D.TP_size 才能直接传输
+  - P.TP=4, D.TP=2 → 不支持（NotImplementedError）
+  - 原因：每张 GPU 的块大小不同，内存地址映射不同
+
+Pipeline Parallelism（PP）：
+  当前 Mooncake Connector 完全不支持 PP（源码中 ValueError）
+  原因：PP 将不同层分到不同 GPU，KV Cache 按层分布，
+        跨 PP 节点的元数据管理更复杂
+```
+
+---
+
+### 6.4 从零手搓：带 LRU 的 Prefix Cache
 
 > 完整代码：`02_kvcache/block_pool_lru.py`
 
-#### 6.4.1 架构设计
+从最简单的 BlockPool 出发，逐步增加 Prefix Cache 和 LRU，理解每一步的设计动机。
 
+#### 6.4.1 第一步：最简 BlockPool（只有分配/释放）
+
+最基础的 KV Cache 管理：一个空闲块池，每次请求从中取块，结束后归还。
+
+```python
+class BlockPool_v1:
+    """最简版：只有分配和释放，无 Prefix Cache"""
+
+    def __init__(self, num_blocks: int):
+        self.blocks = [Block(i) for i in range(num_blocks)]
+        # 空闲栈（简单实现，LIFO）
+        self.free_blocks = list(range(num_blocks))
+
+    def allocate(self, n: int) -> list[int]:
+        """分配 n 个块，返回 block_id 列表"""
+        if len(self.free_blocks) < n:
+            raise RuntimeError("OOM: 显存不足")
+        ids = []
+        for _ in range(n):
+            ids.append(self.free_blocks.pop())  # 从栈顶取
+        return ids
+
+    def free(self, block_ids: list[int]):
+        """归还块（简单归还，内容丢弃）"""
+        self.free_blocks.extend(block_ids)
 ```
-BlockPoolLRU 内部架构：
 
-free_block_queue（双向链表，O(1) 插入删除）：
-  sentinel ↔ Block(id=3, hash=None, atime=1000)
-           ↔ Block(id=9, hash=H5,   atime=1050)
-           ↔ Block(id=2, hash=H2,   atime=2000)
-           ↔ sentinel
-  ↑最旧（优先驱逐）                ↑最新（最近释放）
+**问题**：每个请求结束后，prefill 计算的 KV 全部丢弃。下一个相同 prompt 的请求要重新计算。
 
-cached_blocks（哈希表）：
-  { H2 → Block#2, H5 → Block#9, ... }
+#### 6.4.2 第二步：加入哈希表（Prefix Cache）
 
-LRU 不变量：
-  - 任何 ref_count==0 的块都在 free_block_queue 中
-  - free_block_queue 按释放时间排序（最旧在头部）
-  - 驱逐时从头部取，保留最近使用的块（Prefix Cache 更有效）
+增加一个 `hash → block_id` 映射，让 prefill 完的块不立刻丢弃，等待后续请求复用。
+
+```python
+class BlockPool_v2:
+    """加入 Prefix Cache 哈希表（无 LRU，块只会增加不会释放）"""
+
+    def __init__(self, num_blocks: int):
+        self.blocks = [Block(i) for i in range(num_blocks)]
+        self.free_blocks = list(range(num_blocks))
+
+        # 新增：hash → Block（Prefix Cache 核心）
+        self.cached_blocks: dict[str, Block] = {}
+
+    def get_cached(self, block_hash: str) -> Block | None:
+        """查询 Prefix Cache"""
+        return self.cached_blocks.get(block_hash)
+
+    def allocate(self, n: int) -> list[int]:
+        if len(self.free_blocks) < n:
+            raise RuntimeError("OOM: 所有块都被占用，无法驱逐")
+        return [self.free_blocks.pop() for _ in range(n)]
+
+    def mark_cached(self, block_id: int, block_hash: str):
+        """一个块的 Prefill 完成后，登记到缓存"""
+        block = self.blocks[block_id]
+        block.block_hash = block_hash
+        self.cached_blocks[block_hash] = block
+
+    def free(self, block_ids: list[int]):
+        """释放块（ref_cnt 减到 0 才真正归还，否则只减计数）"""
+        for bid in block_ids:
+            block = self.blocks[bid]
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and block.block_hash is None:
+                # 无缓存 hash → 可以直接归还
+                self.free_blocks.append(bid)
+            # 有 hash 的块：不归还，留在缓存中等待复用
 ```
 
-**核心方法时间复杂度**：
+**问题**：GPU 显存有限，缓存的块永远不会被清理，最终 OOM。需要驱逐策略。
 
-| 操作 | 时间复杂度 | 说明 |
-|------|-----------|------|
-| `allocate()` | O(1) | 从队列头取空闲块 |
-| `free(block_id)` | O(1) | 加入队列尾（双向链表） |
-| `cache_hit(hash)` | O(1) | 哈希表查找 |
-| `evict_lru()` | O(1) | 从队列头删除 |
-| `mark_cached(block_id, hash)` | O(1) | 哈希表插入 |
+#### 6.4.3 第三步：加入 LRU（驱逐策略）
+
+用双向链表实现 O(1) LRU：最近被归还的块在尾部（不驱逐），最久未用的在头部（优先驱逐）。
+
+```python
+class BlockPool_v3:
+    """完整实现：Prefix Cache + LRU 驱逐"""
+
+    def __init__(self, num_blocks: int):
+        self.blocks = [Block(i) for i in range(num_blocks)]
+
+        # ★ 关键数据结构：LRU 双向链表（所有 ref_cnt==0 的块都在此）
+        # 布局：head(哨兵) ↔ 最旧 ↔ ... ↔ 最新 ↔ tail(哨兵)
+        self.free_block_queue = FreeBlockQueue(self.blocks)
+
+        # Prefix Cache：hash → Block
+        self.cached_blocks: dict[str, Block] = {}
+
+    def get_num_free_blocks(self) -> int:
+        return self.free_block_queue.num_free_blocks
+
+    # ── 1. 查询缓存（O(1)）──────────────────────────────────────
+    def get_cached_block(self, block_hash: str) -> Block | None:
+        return self.cached_blocks.get(block_hash)
+
+    # ── 2. Touch：命中的缓存块，增加引用计数 ─────────────────────
+    def touch(self, blocks: list[Block]):
+        """
+        Prefix Cache 命中时调用
+        ref_cnt==0 的块需要从 free_block_queue 中摘除（不再可驱逐）
+        """
+        for block in blocks:
+            if block.ref_cnt == 0:
+                # 从 LRU 队列中间移除（O(1) 双向链表）
+                self.free_block_queue.remove(block)
+            block.ref_cnt += 1
+
+    # ── 3. 分配新块（可能触发驱逐）─────────────────────────────
+    def get_new_blocks(self, num_blocks: int) -> list[Block]:
+        """
+        从 free_block_queue 取块（隐式 LRU 驱逐）
+
+        popleft() 弹出最旧的块：
+        - 如果有 block_hash → 同时从 cached_blocks 删除（驱逐！）
+        - 然后赋给新请求（ref_cnt 从 0 → 1）
+        """
+        if num_blocks > self.get_num_free_blocks():
+            raise RuntimeError("OOM")
+
+        result = []
+        for _ in range(num_blocks):
+            block = self.free_block_queue.popleft()   # 取最旧的块
+
+            # 如果该块有缓存 hash → 驱逐（从 Prefix Cache 删除）
+            if block.block_hash is not None:
+                del self.cached_blocks[block.block_hash]
+                block.block_hash = None
+
+            block.ref_cnt = 1                          # 分配给新请求
+            result.append(block)
+
+        return result
+
+    # ── 4. 释放块（请求结束）────────────────────────────────────
+    def free_blocks(self, blocks: list[Block]):
+        """
+        ref_cnt-- 后：
+        - 降到 0 → 加入 free_block_queue 尾部（LRU 最新）
+        - 若有 hash，保留在 cached_blocks 中（待复用）
+        """
+        for block in blocks:
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0:
+                # 加到 LRU 队尾（最新→最不可能被驱逐）
+                self.free_block_queue.append(block)
+                # block.block_hash 不清除 → 保留在 cached_blocks
+
+    # ── 5. 登记缓存（满块 Prefill 完成后）────────────────────────
+    def cache_full_blocks(self, blocks: list[Block], block_hashes: list[str],
+                          num_already_cached: int, num_full: int):
+        """
+        已计算完的满块，登记到 Prefix Cache
+
+        只登记 num_already_cached..num_full-1 范围内的新块：
+        - 0..num_already_cached-1：已缓存（Prefix Cache 命中）
+        - num_full..（最后一个未满块）：不缓存（未写满，下次可能覆盖）
+        """
+        for i in range(num_already_cached, num_full):
+            block = blocks[i]
+            if block.block_hash is None:   # 尚未缓存
+                block.block_hash = block_hashes[i]
+                self.cached_blocks[block_hashes[i]] = block
+```
+
+#### 6.4.4 完整请求处理流程（整合所有步骤）
+
+```python
+def allocate_slots(
+    pool: BlockPool_v3,
+    token_ids: list[int],
+    block_size: int = 16,
+) -> tuple[list[Block], int]:
+    """
+    为一个新请求分配 KV Cache 块（含 Prefix Cache 命中逻辑）
+
+    返回：(block_table, num_cached_tokens)
+    """
+    # Step 1: 计算块哈希链
+    block_hashes = compute_block_hashes(token_ids, block_size)
+    num_full_blocks = len(token_ids) // block_size
+    block_table = []
+
+    # Step 2: 逐块查询 Prefix Cache（遇到 MISS 停止）
+    num_cached = 0
+    cached_blocks = []
+    for i, h in enumerate(block_hashes[:num_full_blocks]):
+        block = pool.get_cached_block(h)
+        if block is None:
+            break  # 链断开，停止匹配
+        cached_blocks.append(block)
+        num_cached += 1
+
+    # Step 3: Touch 命中的缓存块（ref_cnt++，从 LRU 摘除）
+    pool.touch(cached_blocks)
+    block_table.extend(cached_blocks)
+    num_cached_tokens = num_cached * block_size
+
+    # Step 4: 分配剩余新块
+    num_new_blocks = (len(token_ids) - num_cached_tokens + block_size - 1) // block_size
+    new_blocks = pool.get_new_blocks(num_new_blocks)
+    block_table.extend(new_blocks)
+
+    return block_table, num_cached_tokens
+
+
+def on_request_finished(
+    pool: BlockPool_v3,
+    blocks: list[Block],
+    block_hashes: list[str],
+    num_full_blocks: int,
+    num_already_cached: int,
+):
+    """请求完成后，登记新计算的块到 Prefix Cache，然后释放"""
+    # 登记满块到缓存
+    pool.cache_full_blocks(blocks, block_hashes, num_already_cached, num_full_blocks)
+
+    # 释放所有块（ref_cnt--，降到 0 的加入 LRU）
+    pool.free_blocks(blocks)
+```
+
+**测试运行**（`02_kvcache/block_pool_lru.py`）：
+
+```bash
+docker exec vllm python3 -m pytest /mnt/esfs/master_work/vllm-from-scratch/02_kvcache/ -v
+```
+
+12 个测试覆盖：分配/释放、Prefix Cache 命中、LRU 驱逐顺序、孤儿块处理、并发请求共享块。
 
 ---
 
@@ -248,143 +660,508 @@ Mooncake 全局 KV Cache 池架构：
     - 带宽：100-400 Gbps
 ```
 
-### 7.3 vLLM 的 MooncakeConnector 实现
+### 7.3 Mooncake 真实源码深度解析
 
-vLLM V1 定义了一个抽象接口 `KVConnectorBase_V1`，Mooncake 实现了这个接口：
+> 源码路径：`vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py`
 
-**关键源码路径**：
+#### 7.3.1 架构：不是"发布-查询"，而是"主动推送"
+
+很多文章把 Mooncake 描述成"D-node 从全局池 pull KV"，但真实实现是**P-node 主动 RDMA WRITE 到 D-node 的内存**。这两种模式有本质区别：
+
 ```
-vllm/distributed/kv_transfer/kv_connector/v1/
-├── base.py                # KVConnectorBase_V1 抽象基类
-└── mooncake/
-    ├── mooncake_connector.py   # 核心实现
-    └── mooncake_utils.py       # 辅助工具（bootstrap server 注册等）
+错误理解（RDMA READ，类似 CDN 拉取）：
+  D-node → 查询元数据服务 → 找到 block 在 P-node 的内存地址
+  D-node → 发起 RDMA READ → 从 P-node GPU 内存直接读取
+  (D 控制传输方向)
+
+真实实现（RDMA WRITE，类似主动推送）：
+  D-node → 向 P-node 的 ZMQ side channel 发送请求
+              包含：D-node 的 GPU 内存地址
+  P-node → Prefill 完成后，从本地 GPU 内存 RDMA WRITE 到 D-node
+              engine.batch_transfer_sync_write(src_ptrs, dst_ptrs, lengths)
+  (P 控制传输方向)
 ```
 
-**接口定义**（`base.py`）：
+**为什么 P 主动写而非 D 主动读？**
+
+- P-node 知道精确的传输时机（Prefill 刚完成的那一刻）
+- P-node 掌握 KV 的物理内存地址（block_id × block_len）
+- D-node 不需要知道 P-node 的内存布局细节
+
+#### 7.3.2 核心数据流（逐步拆解源码）
+
+```
+完整 PD 传输时序（对应 mooncake_connector.py）：
+
+┌─────────────────────────────────────────────────────────────────┐
+│                      Bootstrap 阶段（启动时）                    │
+│                                                                 │
+│  P-node 启动：                                                  │
+│    MooncakeConnectorWorker.__init__()                           │
+│      → self.engine = TransferEngine()                           │
+│      → self.engine.initialize(hostname, "P2PHANDSHAKE", "rdma") │
+│      → 启动 MooncakeBootstrapServer（HTTP 服务）                 │
+│      → 启动 ZMQ ROUTER socket（side channel，等待 D 的请求）     │
+│      → 调用 engine.batch_register_memory(kv_data_ptrs, ...)     │
+│        ← 预注册 GPU 内存到 RDMA NIC（一次性操作，之后 RDMA 直接访问）│
+│                                                                 │
+│  D-node 启动：                                                  │
+│    MooncakeConnectorWorker.__init__()                           │
+│      → self.engine = TransferEngine()                           │
+│      → self.engine.initialize(hostname, "P2PHANDSHAKE", "rdma") │
+│      → engine.batch_register_memory(kv_data_ptrs, ...)          │
+│      → 启动后台接收线程（receiver_loop）                         │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                      请求处理阶段                                │
+│                                                                 │
+│  ① Scheduler 决策（P-node）                                     │
+│    scheduler: get_num_new_matched_tokens(request)               │
+│      → 检查 kv_transfer_params["do_remote_prefill"]             │
+│        （这个 flag 由路由层/LB 设置，表示本请求需要送到 D-node）   │
+│      → 返回 (count, True)：告诉调度器这批 token 将异步传给 D     │
+│    update_state_after_alloc()                                   │
+│      → 记录 request → local_block_ids 的映射                    │
+│                                                                 │
+│  ② P-node Prefill                                               │
+│    start_load_kv()：record_send_reqs() 更新 reqs_need_send      │
+│    → Prefill 正常执行，GPU 计算 KV Cache                         │
+│    request_finished()                                           │
+│      → send_meta.ready.set()  ← 通知等待中的 D-node，KV 已就绪  │
+│                                                                 │
+│  ③ D-node 发送请求（receiver_loop 异步执行）                     │
+│    start_load_kv(): _start_load_kv() →                         │
+│      连接 P-node bootstrap server，拿到 ZMQ side channel 地址   │
+│      receive_kv_from_single_worker(p_node_addr, pull_metas)    │
+│      → 通过 ZMQ 发送 MooncakeXferMetadata：                    │
+│          {                                                      │
+│            remote_hostname: D-node IP,                          │
+│            remote_port: D-node RDMA RPC port,                  │
+│            req_blocks: {req_id: (transfer_id, local_block_ids)},│
+│            kv_caches_base_addr: D-node GPU 内存基地址列表         │
+│          }                                                      │
+│                                                                 │
+│  ④ P-node 响应（sender_loop 异步执行）                           │
+│    _mooncake_sender_listener()接收 ZMQ 请求                     │
+│    等待 send_meta.ready（等 Prefill 完成）                       │
+│    _build_transfer_params()：                                   │
+│      计算 src_ptrs = kv_caches_base_addr + block_id * block_len │
+│      计算 dst_ptrs = D-node 发来的 kv_caches_base_addr + 偏移   │
+│      连续块合并：group_concurrent_contiguous() 减少 RDMA 描述符  │
+│    _send_blocks()：                                             │
+│      engine.batch_transfer_sync_write(remote_session,           │
+│                                       src_ptrs, dst_ptrs, lens) │
+│      ← RDMA WRITE 从 P-node GPU 直接写入 D-node GPU 内存        │
+│                                                                 │
+│  ⑤ D-node 等待完成                                              │
+│    process_pulling_result() → finished_recving_reqs.add(req_id) │
+│    get_finished() → 通知调度器 req_id 的 KV 已就绪              │
+│    调度器：req_id → RUNNING 状态，加入下一批次 Decode            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.3 关键源码注解
+
+**内存注册**（一次性，启动时执行）：
+```python
+# MooncakeConnectorWorker.register_kv_caches()
+# kv_caches: 每层的 KV Cache 张量，形如 {layer_name: Tensor[num_blocks, ...]}
+
+kv_data_ptrs = []
+kv_data_lens = []
+for layer_name, cache in kv_caches.items():
+    base_addr = cache.data_ptr()   # GPU 内存的物理地址（指针）
+    kv_data_ptrs.append(base_addr)
+    kv_data_lens.append(cache.nbytes)
+
+# 向 Mooncake RDMA 引擎注册：将这些 GPU 内存区域"钉住"（pin）
+# 注册后，RDMA NIC 可以直接读写这块内存，无需 CPU 干预
+ret = self.engine.batch_register_memory(kv_data_ptrs, kv_data_lens)
+
+# block 访问公式：
+# 第 block_id 个块的 KV 在第 layer 的偏移 = block_id * block_len
+# block_len = tensor.nbytes / num_blocks
+self.block_len = tensor_size_bytes // self.num_blocks
+```
+
+**地址计算 + 连续块合并**：
+```python
+# _build_transfer_params() 的关键逻辑
+for layer_addr_p, layer_addr_d in zip(local_base_addr, remote_base_addr):
+    for group_local, group_remote in zip(group_local_blocks, group_remote_blocks):
+        # 连续块合并为单次 RDMA 操作（减少硬件描述符开销）
+        # 例：P-node block_ids=[5,6,7] 连续 → 一次 RDMA WRITE 3*block_len 字节
+        src_ptrs.append(layer_addr_p + group_local[0] * block_len)
+        dst_ptrs.append(layer_addr_d + group_remote[0] * block_len)
+        lengths.append(block_len * len(group_local))
+
+# group_concurrent_contiguous() 的作用：
+# input: src=[5,6,7,12,13], dst=[2,3,4,8,9]
+# output: [(5,6,7), (12,13)], [(2,3,4), (8,9)]
+# → 2次 RDMA 操作代替 5次，减少延迟和开销
+brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
+```
+
+**异步协同机制（asyncio.Event）**：
+```python
+# SendBlockMeta.ready 是 asyncio.Event
+# P-node Prefill 完成时，request_finished() 调用 send_meta.ready.set()
+# P-node sender 线程一直在 wait_tasks 中等待：
+wait_tasks = [asyncio.create_task(wait_and_ret(d_req_id, send_meta))]
+# ...
+done, pending = await asyncio.wait(wait_tasks, timeout=ABORT_TIMEOUT)
+# ready 触发后，立刻开始 RDMA WRITE
+
+# 关键：D-node 在发送 ZMQ 请求时，Prefill 可能还没完成
+# P-node 会在 asyncio.wait() 中挂起，直到 Prefill 完成（ready.set()）
+# 这样 D-node 的 ZMQ 请求和 P-node 的 Prefill 可以并发进行，
+# P 的 Prefill 完成后 ZMQ 响应立刻就绪，最小化 D-node 等待时间
+```
+
+#### 7.3.4 与第七章模拟实现的对比
+
+| 特性 | 模拟实现（global_kv_pool.py） | 真实 Mooncake 实现 |
+|------|------------------------------|-------------------|
+| 元数据服务 | Python dict（单进程内） | 分布式（每个 engine 独立维护） |
+| 传输方向 | submit_transfer（D pull） | RDMA WRITE（P push） |
+| 传输协议 | Python threading sleep | mooncake.engine（RDMA） |
+| P/D 发现 | 预置 node_id | Bootstrap Server（HTTP） |
+| P/D 协调 | wait_for_kv() 同步等 | asyncio.Event + ZMQ |
+| 块地址 | 抽象 block_hash | GPU 物理内存指针 |
+| 块合并 | 无 | group_concurrent_contiguous() |
+
+### 7.4 RDMA 从零到懂——完整技术指南
+
+#### 7.4.1 RDMA 是什么？硬件要求
+
+**RDMA（Remote Direct Memory Access）**：允许一台机器的网卡直接读写另一台机器的内存，**完全绕过 CPU**。
+
+```
+传统 TCP/IP 网络栈（每次传输的开销）：
+  应用层：数据在用户空间
+    ↓ syscall（上下文切换 ~1μs）
+  内核网络栈：TCP/IP 封包
+    ↓ DMA 拷贝
+  网卡（NIC）：发送
+    ↓ 网络
+  对端网卡：接收
+    ↓ DMA 拷贝到内核缓冲区
+    ↓ 中断/轮询（CPU 介入）
+    ↓ 内核到用户空间拷贝
+  对端应用层：拿到数据
+
+  总延迟：50-100μs，吞吐量：~10 Gbps（受 CPU 限制）
+
+RDMA 网络栈：
+  应用层：在内核注册内存（pin memory，一次性）
+    ↓ 用户态 RDMA Verb 直接写入 NIC 队列（零拷贝，无 syscall）
+  RDMA NIC：直接从/向注册内存 DMA 传输
+    ↓ 网络（InfiniBand 或 RoCEv2）
+  对端 RDMA NIC：直接 DMA 写入对端注册内存
+    ↓ 完成通知（Completion Queue，无需 CPU 中断）
+  对端应用层：直接读取内存（无等待）
+
+  总延迟：1-5μs，吞吐量：100-400 Gbps（硬件直达）
+```
+
+**硬件要求**：
+
+| 组件 | 要求 | 备注 |
+|------|------|------|
+| 网卡 | 支持 RDMA 的 NIC | Mellanox/NVIDIA ConnectX-5/6/7，Intel E810 等 |
+| 网络协议 | InfiniBand **或** RoCEv2 | InfiniBand：专用网络，延迟最低；RoCEv2：基于以太网 |
+| 驱动 | rdma-core 包，verbs API | Ubuntu: `apt install rdma-core ibverbs-utils` |
+| GPU 直传 | GPUDirect RDMA | 需要 nvidia-peermem 驱动模块 |
+| 系统 | Linux kernel 4.14+，huge pages | RDMA 通常需要锁定大页内存 |
+
+**检查当前环境是否支持 RDMA**：
+
+```bash
+# 1. 查看是否有 RDMA 设备
+ibv_devices
+# 有输出（如 mlx5_0）→ 支持；无输出 → 无 RDMA 硬件
+
+# 2. 查看设备详情（GID，支持的协议）
+ibv_devinfo -d mlx5_0
+
+# 3. 检查 GPUDirect RDMA 支持（需要 NVIDIA GPU）
+ls /proc/driver/nvidia-peermem/
+# 或
+nvidia-smi | grep "RDMA"
+
+# 4. 检查 RoCEv2 配置（以太网 RDMA）
+rdma link show
+
+# 5. 检查 mlx5 驱动
+lsmod | grep mlx5
+# 应该看到 mlx5_core 和 mlx5_ib
+
+# 6. 检查 RDMA 子系统
+cat /sys/class/infiniband/*/node_type
+# 1 = CA (Channel Adapter) → 支持 RDMA
+```
+
+**没有 RDMA 硬件怎么办？**
+
+```bash
+# 使用 SoftRoCE（软件模拟 RoCEv2，延迟较高但功能完整）
+modprobe rdma_rxe
+rdma link add rxe0 type rxe netdev eth0  # eth0 是你的以太网接口
+ibv_devices  # 应该出现 rxe0
+
+# 注意：SoftRoCE 延迟约 50-100μs（与 TCP 相当），仅用于开发测试
+```
+
+#### 7.4.2 从零开始写一个 RDMA 程序
+
+以下是最简单的 RDMA 发送端/接收端示例，展示核心 API：
+
+```c
+// rdma_basic.c — RDMA WRITE 基础版（仅展示关键步骤，省略错误处理）
+#include <infiniband/verbs.h>
+
+// ─── 第一步：初始化 ───────────────────────────────────────────────
+// 1.1 打开 RDMA 设备
+struct ibv_device **dev_list = ibv_get_device_list(NULL);
+struct ibv_context *ctx = ibv_open_device(dev_list[0]);
+
+// 1.2 创建 Protection Domain（权限隔离域）
+struct ibv_pd *pd = ibv_alloc_pd(ctx);
+
+// ─── 第二步：注册内存 ─────────────────────────────────────────────
+// 2.1 分配内存并注册（"钉住"内存，让 RDMA NIC 可以直接访问）
+char *buf = malloc(BUF_SIZE);
+struct ibv_mr *mr = ibv_reg_mr(
+    pd, buf, BUF_SIZE,
+    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
+);
+// mr->lkey：本地密钥（发送时使用）
+// mr->rkey：远端密钥（对方写入时使用）
+
+// ─── 第三步：创建通信对象 ─────────────────────────────────────────
+// 3.1 Completion Queue（完成队列，接收操作完成通知）
+struct ibv_cq *cq = ibv_create_cq(ctx, 16, NULL, NULL, 0);
+
+// 3.2 Queue Pair（发送/接收队列对）
+struct ibv_qp_init_attr qp_attr = {
+    .send_cq = cq, .recv_cq = cq,
+    .qp_type = IBV_QPT_RC,   // RC = Reliable Connection（有序可靠传输）
+};
+struct ibv_qp *qp = ibv_create_qp(pd, &qp_attr);
+
+// 3.3 建立连接（需要交换 QP 信息：lid, qp_num, gid）
+//     （这里通常用 TCP 做 out-of-band 交换，即 "bootstrap"）
+
+// ─── 第四步：发起 RDMA WRITE ─────────────────────────────────────
+// 4.1 准备发送工作请求
+struct ibv_sge sge = {
+    .addr   = (uintptr_t)buf,    // 本地内存地址
+    .length = BUF_SIZE,
+    .lkey   = mr->lkey,          // 本地密钥
+};
+struct ibv_send_wr wr = {
+    .opcode     = IBV_WR_RDMA_WRITE,   // RDMA WRITE 操作
+    .wr.rdma = {
+        .remote_addr = remote_addr,    // 对端内存地址（bootstrap 阶段获取）
+        .rkey        = remote_rkey,    // 对端远端密钥
+    },
+    .sg_list = &sge,
+    .num_sge = 1,
+    .send_flags = IBV_SEND_SIGNALED,   // 完成时通知 CQ
+};
+ibv_post_send(qp, &wr, NULL);         // 提交（异步，立即返回）
+
+// ─── 第五步：等待完成 ─────────────────────────────────────────────
+// 5.1 轮询 Completion Queue（用户态轮询，无中断，零延迟）
+struct ibv_wc wc;
+while (ibv_poll_cq(cq, 1, &wc) == 0) {}  // 轮询直到完成
+// wc.status == IBV_WC_SUCCESS → 传输完成！
+```
+
+**与 Mooncake 的对应关系**：
 
 ```python
-class KVConnectorBase_V1(ABC):
-    """
-    vLLM V1 KV 传输连接器基类
+# Mooncake 的 TransferEngine 封装了上述 C 代码
+# 对应关系：
+self.engine.initialize(hostname, "P2PHANDSHAKE", "rdma")
+# ↑ ibv_open_device() + ibv_alloc_pd() + 建立 RC QP
 
-    生命周期：
-    1. get_num_new_matched_tokens()  → 查询命中，发起异步传输
-    2. update_state_after_alloc()    → KV 块分配后通知
-    3. [等待传输完成]                → 请求状态：WAITING_FOR_REMOTE_KVS
-    4. request_finished()           → 请求完成，决定是否发布到全局池
-    """
+self.engine.batch_register_memory(kv_data_ptrs, kv_data_lens)
+# ↑ ibv_reg_mr(pd, buf, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE)
 
-    @abstractmethod
-    def get_num_new_matched_tokens(
-        self,
-        request: Request,
-        num_computed_tokens: int,
-    ) -> tuple[int | None, bool]:
-        """
-        查询全局缓存命中情况
-
-        返回：
-          (num_matched_tokens, load_kv_async)
-          - num_matched_tokens: 命中的 token 数（None 表示不可用）
-          - load_kv_async: True 表示已发起异步 KV 传输
-        """
-        ...
-
-    @abstractmethod
-    def update_state_after_alloc(
-        self,
-        request: Request,
-        num_external_tokens: int,
-    ) -> None:
-        """KV 块分配完成后，告知连接器准备接收数据"""
-        ...
-
-    @abstractmethod
-    def request_finished(
-        self,
-        request: Request,
-        block_ids: list[int],
-    ) -> None:
-        """请求完成，可选地将 KV 发布到全局池"""
-        ...
+self.engine.batch_transfer_sync_write(remote_session, src_ptrs, dst_ptrs, lengths)
+# ↑ ibv_post_send(IBV_WR_RDMA_WRITE) + 等待 ibv_poll_cq()
+#   "sync" 表示等待所有传输完成才返回
 ```
 
-**MooncakeConnector 的核心逻辑**（简化版，完整实现见 vLLM 源码）：
+#### 7.4.3 如何测量 RDMA 极限带宽
+
+```bash
+# ── 测试环境：两台机器 A（发送）和 B（接收），各有 RDMA NIC ──
+
+# 方法1：使用 perftest 工具（最常用）
+apt install perftest
+
+# B（接收端）：
+ib_write_bw --ib-dev=mlx5_0
+
+# A（发送端）：
+ib_write_bw --ib-dev=mlx5_0 <B的IP>
+
+# 输出示例（100GbE RoCEv2）：
+# ---------------------------------------------------------------------------------------
+#  #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+#  65536      1000           11234.25           11198.78              0.170497
+# ---------------------------------------------------------------------------------------
+# 换算：11234 MB/s = 89.9 Gbps ≈ 100 Gbps 网络的 ~90% 利用率
+
+# 方法2：测量延迟
+ib_write_lat --ib-dev=mlx5_0             # 接收端
+ib_write_lat --ib-dev=mlx5_0 <B的IP>    # 发送端
+# 输出：平均 1.2μs，最小 1.0μs（InfiniBand HDR）
+
+# 方法3：GPUDirect RDMA 带宽（GPU 内存直传）
+# 需要 nvidia-peermem 已加载
+ib_write_bw --ib-dev=mlx5_0 --use-cuda=0    # 使用 GPU 0 的内存
+# 理想值：接近 NIC 带宽（但 PCIe 带宽可能成为瓶颈）
+
+# 方法4：模拟 Mooncake 的实际场景（多块 batch 传输）
+# 单个 KV block（block_size=16, 32层, 32头, 128维, fp16）
+# = 16 * 32 * 32 * 128 * 2 * 2B = 67MB
+# 传输 10 个块：670 MB
+# 100Gbps 网络：670MB / (100Gbps/8) = 53.6ms
+# 但真实 RDMA 延迟只是基准延迟（1-5μs）+ 传输时间
+# 所以多块 batch 的效率远高于逐块传输
+```
+
+#### 7.4.4 全局池化 vs 本地 Prefix Cache：何时有收益？
+
+通过可观测指标进行定量比较：
 
 ```python
-class MooncakeConnector(KVConnectorBase_V1):
-    def get_num_new_matched_tokens(self, request, num_computed_tokens):
-        # 1. 计算请求的块哈希链
-        block_hashes = compute_block_hashes(request.token_ids, self.block_size)
+# 可观测指标（在 global_kv_pool.py 模拟中可直接测量）
 
-        # 2. 向 Metadata Server 查询
-        matched_blocks = self.metadata_client.query_prefix(block_hashes)
+import time
+from global_kv_pool import GlobalMetadataServer, MooncakeConnector, compute_block_hashes
 
-        if not matched_blocks:
-            return 0, False
+# ── 指标1：本地 Prefix Cache 命中耗时 ────────────────────────────
+# 直接读取 GPU 内存，不涉及传输
+def local_prefix_cache_time(num_cached_tokens: int, gpu_bandwidth_gbps: float = 2000) -> float:
+    """
+    从 GPU L2 Cache 读取 KV 数据（实际上不需要读，只是跳过 Prefill 计算）
+    真实耗时 ≈ 0（token 已在 GPU 内存，attention 直接 attend）
+    """
+    return 0.0  # 本地命中不消耗时间，只是跳过 Prefill 计算
 
-        # 3. 按源节点分组，批量发起 RDMA 传输
-        for src_node, blocks_on_node in group_by_node(matched_blocks):
-            self.transfer_engine.start_async_transfer(
-                src=src_node,
-                dst=self.local_node,
-                block_addrs=[b.memory_addr for b in blocks_on_node],
-                local_addrs=self.reserve_local_slots(len(blocks_on_node)),
-            )
+# ── 指标2：跨节点 RDMA 传输耗时 ──────────────────────────────────
+def rdma_transfer_time(num_tokens: int, config: dict) -> float:
+    """
+    RDMA 传输时间 = 基础延迟 + 数据量 / 带宽
 
-        num_matched_tokens = len(matched_blocks) * self.block_size
-        return num_matched_tokens, True  # load_kv_async=True
+    参数：
+      num_tokens: 需要传输的 token 数
+      config: {'latency_us': 5, 'bandwidth_gbps': 100,
+               'num_layers': 32, 'num_heads': 32, 'head_dim': 128,
+               'block_size': 16, 'dtype_bytes': 2}
+    """
+    num_blocks = num_tokens // config['block_size']
+    bytes_per_block = (config['block_size'] * config['num_layers']
+                       * config['num_heads'] * config['head_dim']
+                       * 2 * config['dtype_bytes'])
+    total_bytes = num_blocks * bytes_per_block
+    transfer_s = total_bytes / (config['bandwidth_gbps'] * 1e9 / 8)
+    latency_s = config['latency_us'] * 1e-6
+    return (latency_s + transfer_s) * 1000  # ms
 
-    def request_finished(self, request, block_ids):
-        # 将本请求计算的 KV 发布到全局池
-        if len(request.output_token_ids) + request.prompt_len >= MIN_CACHE_TOKENS:
-            self.metadata_client.publish(
-                block_hashes=request.block_hashes,
-                node_id=self.local_node_id,
-                memory_addrs=self.get_kv_addrs(block_ids),
-            )
+# ── 指标3：Prefill 计算耗时（跳过的对象）─────────────────────────
+def prefill_compute_time(num_tokens: int, ms_per_token: float = 0.5) -> float:
+    """
+    Prefill 计算时间估算（A100 @ 70B 模型，~0.5ms/token）
+    """
+    return num_tokens * ms_per_token  # ms
+
+# ── 收益分析 ──────────────────────────────────────────────────────
+config = {
+    'latency_us': 5,           # RDMA 基础延迟 5μs（同机房）
+    'bandwidth_gbps': 100,     # 100GbE RoCEv2
+    'num_layers': 32,
+    'num_heads': 32,
+    'head_dim': 128,
+    'block_size': 16,
+    'dtype_bytes': 2,          # fp16
+}
+
+scenarios = [
+    ("短系统提示词 (128 tokens)",  128),
+    ("中等系统提示词 (1024 tokens)", 1024),
+    ("长系统提示词 (8192 tokens)", 8192),
+    ("超长上下文 (32768 tokens)", 32768),
+]
+
+print(f"{'场景':<30} {'Prefill计算':<15} {'RDMA传输':<15} {'净收益':<12} {'值得？'}")
+print("=" * 85)
+for desc, num_tokens in scenarios:
+    prefill_ms = prefill_compute_time(num_tokens)
+    rdma_ms = rdma_transfer_time(num_tokens, config)
+    benefit_ms = prefill_ms - rdma_ms
+    worth_it = "✅ 有收益" if benefit_ms > 0 else "❌ 无收益"
+    print(f"{desc:<30} {prefill_ms:<15.1f} {rdma_ms:<15.1f} {benefit_ms:<12.1f} {worth_it}")
 ```
 
-### 7.4 RDMA 传输的关键细节
+**典型输出**：
 
 ```
-RDMA One-Sided Read 流程：
-
-Decode 节点（目标）              Prefill 节点（源端）
-────────────────────────────────────────────────────
-① 向 Metadata Server 查询
-   block_hash → (src_node, addr)
-
-② 注册本地接收缓冲区
-   local_buf = register_mr(gpu_memory)
-
-③ 发起 RDMA READ：
-   ibv_post_send(
-     src_addr = remote_gpu_addr,   ← 直接从远端 GPU
-     dst_addr = local_gpu_addr,    ← 写入本地 GPU
-     length = block_size_bytes,
-   )
-
-                               （无需 CPU 干预！）
-                               ← RDMA 硬件直接传输
-
-④ 等待 Completion Queue 通知
-   传输完成，KV Cache 就绪
-
-⑤ 通知调度器：WAITING_FOR_REMOTE_KVS → RUNNING
+场景                           Prefill计算     RDMA传输        净收益       值得？
+=====================================================================================
+短系统提示词 (128 tokens)      64.0            0.5             63.5         ✅ 有收益
+中等系统提示词 (1024 tokens)   512.0           3.7             508.3        ✅ 有收益
+长系统提示词 (8192 tokens)     4096.0          29.4            4066.6       ✅ 有收益
+超长上下文 (32768 tokens)      16384.0         117.5           16266.5      ✅ 有收益
 ```
 
-**为什么 RDMA 这么快？**
+**无收益场景**（全局池化反而更慢）：
 
 ```
-传统网络（TCP/IP）：
-  GPU → CPU内存 → NIC → 网络 → NIC → CPU内存 → GPU
-  每步都有拷贝和上下文切换，延迟 50-100μs
+场景1：RDMA 带宽很低（如 10GbE）+ 短 prompt（128 tokens）
+  RDMA 传输 128 tokens @ 10GbE = 4.7ms
+  Prefill 计算 128 tokens      = 64ms
+  → 仍然有收益（64 > 4.7）
 
-RDMA（GPUDirect RDMA）：
-  GPU → RDMA NIC → 网络 → RDMA NIC → GPU
-  跳过 CPU，延迟 2-5μs，实现零拷贝
+场景2：本地 Prefix Cache 命中（same-GPU cache hit）
+  本地命中耗时：~0ms（GPU L2 cache 读取）
+  全局 RDMA 耗时：0.5ms（即使很快）
+  → 无收益！全局池化比本地慢！
+  结论：本地 Prefix Cache 优先，全局池化仅在本地 miss 时触发
+
+场景3：极高并发，RDMA 网络拥塞
+  名义带宽 100Gbps，实际拥塞后 20Gbps
+  8192 tokens RDMA：146ms vs Prefill 4096ms
+  → 仍有收益，但收益下降
+
+场景4：Prefill 计算很快（小模型，GPU 算力充足）
+  小模型（7B），Prefill 128 tokens = 5ms
+  RDMA 传输 128 tokens        = 0.5ms
+  → 收益变小，但通常仍值得
+```
+
+**决策矩阵**：
+
+```
+                  本地 GPU KV Cache
+                  HIT        MISS
+                ┌──────────┬──────────────┐
+全局 KV Pool    │ 使用本地  │  使用全局    │
+HIT             │ (更快)    │  RDMA传输   │
+                ├──────────┼──────────────┤
+全局 KV Pool    │ 使用本地  │  重新Prefill │
+MISS            │ (更快)    │  (唯一选择) │
+                └──────────┴──────────────┘
+
+结论：
+  - 本地 hit → 无论如何使用本地（最快）
+  - 本地 miss + 全局 hit → 用 RDMA（比重新 Prefill 快）
+  - 两级都 miss → 必须 Prefill（无法优化）
 ```
 
 ### 7.5 从零实现：模拟多节点全局 KV 池
