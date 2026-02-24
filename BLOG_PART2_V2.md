@@ -1912,127 +1912,1085 @@ def wait_for_kv(self, request_id: str, timeout: float = 5.0) -> bool:
 
 > 源码路径：`vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/`
 
-7.5 节的模拟实现揭示了全局 KV 池的设计原理。vllm-ascend 的 **AscendStore** 是真实生产中的全局 KV 池实现，结构更为复杂，但核心逻辑与模拟版一一对应。
+7.5 节的模拟实现揭示了全局 KV 池的设计原理。vllm-ascend 的 **AscendStore** 是真实生产中的全局 KV 池实现，是本章的核心方案。本节将逐层拆解其四层架构、关键数据结构、请求生命周期、传输线程精髓，以及 MooncakeDistributedStore 后端原理，最后提供完整的"从零手搓"七步实现骨架。
 
-#### 7.6.1 整体架构
+#### 7.6.1 完整四层架构
+
+AscendStore 由四层组件构成，每层职责清晰分离：
 
 ```mermaid
 flowchart TD
-    subgraph Engine0["Node 0（任意角色）"]
-        SC0["AscendStoreConnector<br/>Scheduler 侧"]
-        WK0["AscendStoreConnector<br/>Worker 侧"]
-        PS0["KVPoolScheduler<br/>ZMQ lookup 客户端"]
-        PW0["KVPoolWorker<br/>存取线程"]
-        SC0 --> PS0
-        WK0 --> PW0
+    subgraph Conn["连接层（KVConnectorBase_V1 接口）"]
+        ASSC["AscendStoreConnector\nscheduler-side"]
+        ASCW["AscendStoreConnector\nworker-side"]
     end
 
-    subgraph Engine1["Node 1"]
-        SC1["AscendStoreConnector"] --> PS1["KVPoolScheduler"]
-        WK1["AscendStoreConnector"] --> PW1["KVPoolWorker"]
+    subgraph Sched["调度层（Scheduler Process）"]
+        PS["KVPoolScheduler\n_request_trackers / load_specs"]
+        LC["LookupKeyClient\nZMQ REQ socket"]
+        PS --> LC
     end
 
-    subgraph Backend["存储后端"]
-        MC["MooncakeDistributedStore<br/>（分布式 KV 存储）"]
-        MEM["MemcacheBackend<br/>（内存缓存，测试用）"]
+    subgraph Work["Worker 层（Worker Process）"]
+        PW["KVPoolWorker\nregister / start_load / wait_for_save"]
+        LS["LookupKeyServer\nZMQ REP socket"]
+        ST["KVCacheStoreSendingThread\nPUT + GPU event + dedup"]
+        RT["KVCacheStoreRecvingThread\nGET + blocking"]
+        PW --> LS
+        PW --> ST
+        PW --> RT
     end
 
-    PS0 <-->|"ZMQ RPC<br/>lookup(block_hashes)"| PS1
-    PW0 <-->|"RDMA<br/>put/get"| MC
-    PW1 <-->|"RDMA<br/>put/get"| MC
-    MC -.->|备选| MEM
+    subgraph Back["后端存储层"]
+        MB["MooncakeBackend\nbatch_put / batch_get / batch_is_exist"]
+        MDS["MooncakeDistributedStore\n分布式 RDMA 存储"]
+        MEM["MemcacheBackend\n内存缓存，测试用"]
+        MB --> MDS
+        MB -.->|备选| MEM
+    end
+
+    ASSC --> PS
+    ASCW --> PW
+    LC <-->|"intra-node ZMQ REQ/REP\n（同节点 Scheduler↔Worker IPC）"| LS
+    ST <-->|"RDMA batch_put"| MB
+    RT <-->|"RDMA batch_get"| MB
 ```
 
-与 7.5 模拟版的对应关系：
+**与 7.5 模拟版的对应关系：**
 
-| 模拟版 | AscendStore | 职责 |
-|--------|-------------|------|
-| `GlobalMetadataServer` | `KVPoolScheduler` + ZMQ RPC | 查询哪个节点有哪些 block |
-| `TransferEngine` | `KVPoolWorker` + 传输线程 | 执行实际 KV 读写 |
-| `MooncakeConnector.publish_kv()` | `save_kv_layer()` | 存 KV 到全局池 |
-| `MooncakeConnector.wait_for_kv()` | `wait_for_layer_load()` | 等待 KV 加载完成 |
+| 模拟版 | AscendStore 对应组件 | 职责 |
+|--------|---------------------|------|
+| `GlobalMetadataServer` | `KVPoolScheduler` + `LookupKeyClient/Server` | 查询哪些 block 已缓存 |
+| `TransferEngine` | `KVCacheStoreSendingThread` + `RecvingThread` | 执行实际 KV 读写 |
+| `publish_kv()` | `wait_for_save()` → `SendingThread` | 将 KV 写入全局池 |
+| `wait_for_kv()` | `wait_for_layer_load()` | 等待 KV 从全局池加载 |
+| `hash(tuple(tokens))` | `PoolKey.to_string()` (SHA-256) | 内容寻址，跨节点去重 |
 
-#### 7.6.2 多后端设计
+**两个关键设计决策：**
 
-AscendStore 抽象了存储后端，支持热插拔：
+- **ZMQ 是 Intra-Node（同节点）的**：Scheduler Process 和 Worker Process 运行在同一台机器上，ZMQ IPC socket 只负责进程间通信。跨节点查询通过 MooncakeDistributedStore 的 etcd 元数据服务完成。
+- **`delay_free=False`**：与上游 MooncakeConnector（P2P 模式，`delay_free=True`）不同，AscendStore 是全局池，写入后 block 不依赖 D 节点持有，因此不需要延迟释放。
+
+---
+
+#### 7.6.2 关键数据结构
+
+理解数据结构是读懂整个系统的前提。
+
+**PoolKey：内容寻址存储键**
 
 ```python
-# pool_worker.py:135-141
-backend_map = {
-    "mooncake": MooncakeBackend,    # 分布式 RDMA 存储（生产首选）
-    "memcache": MemcacheBackend,    # 内存缓存（测试/小集群）
-}
-self.backend = backend_map[config.backend_type]()
+# config_data.py
+import hashlib, dataclasses
+
+@dataclasses.dataclass
+class PoolKey:
+    model_name: str         # 模型名称（不同模型 KV 形状不通用）
+    head_or_tp_rank: int    # TP 并行时区分不同 rank（各 rank KV 数据不同）
+    chunk_hash: bytes       # SHA-256(token_ids.tobytes())，内容寻址核心
+    pp_rank: int = 0        # PP 并行时区分不同流水线阶段（各 stage 层不同）
+
+    def to_string(self) -> str:
+        """生成全局唯一存储键，格式：model@head:rank@pp:stage@hexhash"""
+        hash_hex = self.chunk_hash.hex()
+        return (f"{self.model_name}"
+                f"@head:{self.head_or_tp_rank}"
+                f"@pp:{self.pp_rank}"
+                f"@{hash_hex}")
 ```
 
-**MooncakeBackend**（`backend/mooncake_backend.py`）：
+为什么要把 `tp_rank` 编入 key？
+
+```
+TP=4 时，同一 block 的 KV 在 4 个 rank 上各不同：
+  rank 0 存 head 0~7  的 K/V
+  rank 1 存 head 8~15 的 K/V
+  rank 2 存 head 16~23 的 K/V
+  rank 3 存 head 24~31 的 K/V
+
+所以 PoolKey 必须包含 tp_rank，避免跨 rank 混用 KV 数据。
+```
+
+**ChunkedTokenDatabase：调度器侧的 block 哈希缓存**
 
 ```python
-class MooncakeBackend(Backend):
-    def __init__(self, parallel_config):
-        self.store = MooncakeDistributedStore()
-        self.store.setup(
-            local_seg=local_segment,
-            metadata_server=metadata_server_addr,
-            global_segment_size=global_seg_size,
-            transfer_engine=transfer_engine,
+# config_data.py（概念简化版）
+import hashlib
+import numpy as np
+
+class ChunkedTokenDatabase:
+    """把 token 序列分块，维护每块的 SHA-256 哈希（避免重复计算）"""
+
+    def __init__(self, block_size: int):
+        self.block_size = block_size
+        self._hash_db: dict[int, bytes] = {}  # block_idx → SHA-256 digest
+
+    def update(self, token_ids: list[int]) -> None:
+        """计算并缓存所有完整块的哈希值"""
+        for idx in range(len(token_ids) // self.block_size):
+            if idx in self._hash_db:
+                continue  # 已计算，跳过
+            chunk = token_ids[idx * self.block_size:(idx + 1) * self.block_size]
+            self._hash_db[idx] = hashlib.sha256(
+                np.array(chunk, dtype=np.int32).tobytes()
+            ).digest()  # 返回 bytes（32 字节）
+
+    def get_hashes(self, num_blocks: int) -> list[bytes]:
+        return [self._hash_db[i] for i in range(num_blocks)]
+```
+
+**ReqMeta 与 LoadSpec：请求元数据**
+
+```python
+# config_data.py
+@dataclasses.dataclass
+class ReqMeta:
+    """Worker 侧：描述一个 block 集合的存取任务"""
+    req_id: str
+    keys: list[str]          # PoolKey.to_string() 列表（全局存储键）
+    kv_addrs: list[int]      # GPU 内存地址（每个 block 首地址，DMA 可访问）
+    kv_sizes: list[int]      # 每个 block 的字节大小
+    event: "torch.cuda.Event | None"  # GPU event，用于 SendingThread 同步
+
+@dataclasses.dataclass
+class LoadSpec:
+    """Scheduler 侧：描述需要从全局池加载的 block 信息"""
+    req_id: str
+    num_matched_blocks: int     # 命中的 block 数量
+    block_hashes: list[bytes]   # 各 block 的 SHA-256 原始 bytes
+    block_ids: list[int]        # 本地物理 block ID（update_state_after_alloc 后填充）
+```
+
+---
+
+#### 7.6.3 调度器侧生命周期
+
+调度器侧（Scheduler Process）通过 `KVPoolScheduler` 管理请求状态，通过 ZMQ 向同节点 Worker 查询全局池命中情况。
+
+**`get_num_new_matched_tokens()`：ZMQ 查询全局池**
+
+```python
+# pool_scheduler.py（精简注释版）
+class KVPoolScheduler:
+    def __init__(self, block_size, model_name, tp_rank, pp_rank):
+        self.block_size = block_size
+        self.model_name = model_name
+        self.tp_rank    = tp_rank
+        self.pp_rank    = pp_rank
+        # per-request 状态
+        self._chunked_dbs:      dict[str, ChunkedTokenDatabase] = {}
+        self._request_trackers: dict[str, int]                  = {}  # req_id → 已确认命中块数
+        self.load_specs:        dict[str, LoadSpec]             = {}
+        # ZMQ 查询客户端（intra-node）
+        self.lookup_client = LookupKeyClient(ipc_path="/tmp/kv_lookup.ipc")
+
+    def get_num_new_matched_tokens(
+        self, request, num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        req_id    = request.request_id
+        token_ids = request.inputs.prompt_token_ids
+
+        # 1. 更新分块哈希缓存
+        db = self._chunked_dbs.setdefault(
+            req_id, ChunkedTokenDatabase(self.block_size)
+        )
+        db.update(token_ids)
+
+        # 2. 计算本次要查询的范围
+        total_blocks    = len(token_ids) // self.block_size
+        prev_matched    = self._request_trackers.get(req_id, 0)
+        blocks_to_query = total_blocks - prev_matched
+        if blocks_to_query <= 0:
+            return 0, False
+
+        # 3. ZMQ 查询：向同节点 Worker 发送哈希列表
+        all_hashes = db.get_hashes(total_blocks)
+        new_hashes = all_hashes[prev_matched:]
+        hit_count  = self.lookup_client.lookup(
+            token_len=len(token_ids),
+            hashes=new_hashes,
         )
 
+        # 4. 更新命中状态
+        new_total_matched = prev_matched + hit_count
+        self._request_trackers[req_id] = new_total_matched
+
+        # 5. 保存 LoadSpec（供 build_connector_meta 使用）
+        if hit_count > 0:
+            self.load_specs[req_id] = LoadSpec(
+                req_id=req_id,
+                num_matched_blocks=new_total_matched,
+                block_hashes=all_hashes[:new_total_matched],
+                block_ids=[],   # 待 update_state_after_alloc 填充
+            )
+
+        return hit_count * self.block_size, hit_count > 0
+```
+
+**ZMQ Lookup 通信协议**
+
+```
+Scheduler Process                       Worker Process
+────────────────                        ──────────────
+LookupKeyClient (ZMQ REQ)    →→→→→    LookupKeyServer (ZMQ REP)
+                                               │
+frames = [                                     ↓
+  token_len (8 bytes LE),             构造 PoolKey 列表
+  hash_0 (32 bytes SHA-256),          backend.exists(keys)   ← MooncakeStore etcd 查询
+  hash_1 (32 bytes),                  计算前缀连续命中数
+  ...
+]                               ←←←←  reply = hit_count (8 bytes LE)
+```
+
+**`update_state_after_alloc()`：记录物理 block ID**
+
+```python
+def update_state_after_alloc(self, request, blocks, num_lookahead_slots):
+    """Scheduler 分配物理 block 后调用，把 block_id 填入 LoadSpec"""
+    spec = self.load_specs.get(request.request_id)
+    if spec is None:
+        return
+    # 从 request 的 block table 取前 num_matched_blocks 个物理 block ID
+    spec.block_ids = request.get_block_ids()[:spec.num_matched_blocks]
+```
+
+**`build_connector_meta()`：打包 IPC 元数据**
+
+```python
+# ascend_store_connector.py（scheduler-side）
+def build_connector_meta(self, request) -> AscendConnectorMetadata | None:
+    """把 LoadSpec 封装为跨进程 IPC 消息（通过 vLLM 内部机制传递给 Worker）"""
+    spec = self.scheduler.load_specs.pop(request.request_id, None)
+    if spec is None:
+        return None
+    return AscendConnectorMetadata(
+        req_id=spec.req_id,
+        num_matched_blocks=spec.num_matched_blocks,
+        block_hashes=spec.block_hashes,
+        block_ids=spec.block_ids,
+    )
+```
+
+---
+
+#### 7.6.4 Worker 侧生命周期
+
+Worker Process 接收 Scheduler 发来的 `AscendConnectorMetadata`，通过 `KVPoolWorker` 执行实际的 KV 加载和存储。
+
+**`register_kv_caches()`：向后端注册 GPU 内存**
+
+```python
+# pool_worker.py
+class KVPoolWorker:
+    def register_kv_caches(self, kv_caches: list[torch.Tensor]) -> None:
+        """
+        把所有层的 GPU KV Cache 内存段注册到 MooncakeDistributedStore。
+        注册后，RDMA 传输可直接操作这些显存地址，无需额外拷贝。
+        """
+        self.kv_caches = kv_caches
+        for kv_cache in kv_caches:
+            # 向传输引擎注册这块 GPU 内存（地址 + 大小）
+            self.backend.register_buffer(
+                addr=kv_cache.data_ptr(),
+                size=kv_cache.nbytes,
+            )
+        # 计算单个 block 的字节大小（所有层合并）
+        # kv_cache shape: [2, num_blocks, block_size, num_heads, head_size]
+        single_block_elems = kv_caches[0][0][0].numel()  # 一层一个 block 的元素数
+        self.block_bytes = (
+            kv_caches[0].element_size()
+            * single_block_elems
+            * len(kv_caches)  # 所有层
+        )
+```
+
+**`start_load_kv()`：异步触发跨节点 KV 加载**
+
+```python
+def start_load_kv(
+    self,
+    scheduler_output: SchedulerOutput,
+    finished_reqs: list[str],
+) -> None:
+    """读取 AscendConnectorMetadata，为每个命中请求提交 RDMA GET 任务"""
+    meta: AscendConnectorMetadata = scheduler_output.connector_metadata
+    if meta is None:
+        return
+
+    for load_req in meta.load_requests:
+        # 1. 根据物理 block_ids 计算 GPU 内存地址
+        addrs = [
+            self.kv_caches[0].data_ptr() + bid * self.block_bytes
+            for bid in load_req.block_ids[:load_req.num_matched_blocks]
+        ]
+        sizes = [self.block_bytes] * load_req.num_matched_blocks
+
+        # 2. 构造内容寻址存储键（与 SendingThread 存入时完全一致）
+        keys = [
+            PoolKey(
+                model_name=self.model_name,
+                head_or_tp_rank=self.tp_rank,
+                chunk_hash=h,
+                pp_rank=self.pp_rank,
+            ).to_string()
+            for h in load_req.block_hashes
+        ]
+
+        # 3. 提交给 RecvingThread 异步执行 RDMA GET
+        req_meta = ReqMeta(
+            req_id=load_req.req_id,
+            keys=keys, kv_addrs=addrs, kv_sizes=sizes,
+            event=None,  # 加载不需要 GPU event
+        )
+        done_event = self.kv_recv_thread.add_request(req_meta)
+        self._load_events[load_req.req_id] = done_event
+```
+
+**`wait_for_save()`：GPU Event 同步后异步存储**
+
+```python
+def wait_for_save(self, request, finished: bool) -> bool:
+    """
+    请求完成（计算结束）后，异步将 KV 写入全局池。
+    核心问题：GPU 是异步的，KV 计算和 CPU 代码并行执行，
+    必须用 Event 确保 KV 写入显存后再发起 RDMA。
+    """
+    if not finished:
+        return False
+
+    # 1. 创建 GPU/NPU Event 并在当前 stream 上打点（非阻塞）
+    #    这个 event 标记"KV 计算已完成"的时间点
+    event = torch.cuda.Event()
+    event.record()  # 在 NPU stream 上打点，CPU 立即返回
+
+    # 2. 构造存储任务
+    block_ids    = request.get_block_ids()
+    block_hashes = self._get_block_hashes(request)
+    addrs = [
+        self.kv_caches[0].data_ptr() + bid * self.block_bytes
+        for bid in block_ids
+    ]
+    keys = [
+        PoolKey(self.model_name, self.tp_rank, h, self.pp_rank).to_string()
+        for h in block_hashes
+    ]
+
+    # 3. 提交给 SendingThread（含 event）
+    #    SendingThread 会在合适时机调用 event.synchronize()
+    req_meta = ReqMeta(
+        req_id=request.request_id,
+        keys=keys,
+        kv_addrs=addrs,
+        kv_sizes=[self.block_bytes] * len(block_ids),
+        event=event,
+    )
+    self.kv_send_thread.add_request(req_meta)
+
+    # delay_free=False：AscendStore 全局池不依赖延迟释放
+    return False
+```
+
+---
+
+#### 7.6.5 传输线程：GPU Event 同步与去重
+
+传输线程是 AscendStore 中最精密的部分，解决两个核心问题：
+1. **正确性**：如何确保 KV 计算完成后再传输？→ GPU Event 同步
+2. **效率**：如何避免重复传输相同的 block？→ 内容寻址去重
+
+**KVCacheStoreSendingThread**
+
+```python
+# kv_transfer.py
+import queue, threading, torch
+from .backend import Backend
+
+class KVCacheStoreSendingThread(threading.Thread):
+    """
+    专用后台线程：把 NPU/GPU 上的 KV 异步写入 MooncakeStore。
+    流程：去重检查 → GPU Event 同步 → 批量 RDMA PUT
+    """
+    def __init__(self, backend: Backend):
+        super().__init__(daemon=True)
+        self.backend = backend
+        self._queue: queue.Queue[ReqMeta | None] = queue.Queue()
+
+    def add_request(self, req_meta: ReqMeta) -> None:
+        """主线程调用（非阻塞），把任务入队"""
+        self._queue.put(req_meta)
+
+    def run(self) -> None:
+        while True:
+            req_meta = self._queue.get()
+            if req_meta is None:  # 哨兵值，退出
+                break
+            self._handle_put(req_meta)
+
+    def _handle_put(self, req_meta: ReqMeta) -> None:
+        # ── Step 1：去重检查（避免 RDMA 重复写入相同 block）──────────
+        # 内容寻址：不同节点对相同 token 序列产生相同 key
+        # 若 block 已在全局池中（另一个 P 节点已存入），直接跳过
+        exists_flags = self.backend.exists(req_meta.keys)
+        new_keys, new_addrs, new_sizes = [], [], []
+        for key, addr, size, exists in zip(
+            req_meta.keys, req_meta.kv_addrs, req_meta.kv_sizes, exists_flags
+        ):
+            if not exists:
+                new_keys.append(key)
+                new_addrs.append(addr)
+                new_sizes.append(size)
+
+        if not new_keys:
+            return  # 全部已缓存，无需传输
+
+        # ── Step 2：等待 GPU/NPU 计算完成（关键同步点）──────────────
+        # event.synchronize() 会阻塞当前 CPU 线程，等待 NPU stream
+        # 到达 event 记录时刻——确保 KV 数据已写入显存。
+        #
+        # 时序保证：
+        #   NPU:  ... → Attn 计算 KV → [event.record()] → 继续计算
+        #   CPU(SendingThread): ... → event.synchronize() → RDMA PUT
+        #                                    ↑
+        #                            此处等待，直到 NPU 过了 record 时刻
+        if req_meta.event is not None:
+            req_meta.event.synchronize()
+
+        # ── Step 3：批量 RDMA PUT（零拷贝，直接从 GPU 显存写出）────
+        self.backend.put(new_keys, new_addrs, new_sizes)
+```
+
+**KVCacheStoreRecvingThread**
+
+```python
+# kv_transfer.py
+class KVCacheStoreRecvingThread(threading.Thread):
+    """
+    专用后台线程：从 MooncakeStore 异步加载 KV 到本地 GPU 显存。
+    """
+    def __init__(self, backend: Backend):
+        super().__init__(daemon=True)
+        self.backend = backend
+        self._queue: queue.Queue[ReqMeta | None] = queue.Queue()
+        self._done_events: dict[str, threading.Event] = {}
+
+    def add_request(self, req_meta: ReqMeta) -> threading.Event:
+        """主线程调用，返回 Event 供 wait_for_layer_load() 等待"""
+        done_event = threading.Event()
+        self._done_events[req_meta.req_id] = done_event
+        self._queue.put(req_meta)
+        return done_event
+
+    def run(self) -> None:
+        while True:
+            req_meta = self._queue.get()
+            if req_meta is None:
+                break
+            self._handle_get(req_meta)
+
+    def _handle_get(self, req_meta: ReqMeta) -> None:
+        # RDMA GET：从全局池把 KV 拉到本地 GPU 显存（blocking=True）
+        # MooncakeStore 自动路由到存有该 key 的节点（通过 etcd 查 local_seg）
+        self.backend.get(
+            req_meta.keys,
+            req_meta.kv_addrs,
+            req_meta.kv_sizes,
+        )
+        # 通知 wait_for_layer_load()：加载完成
+        done_event = self._done_events.pop(req_meta.req_id, None)
+        if done_event:
+            done_event.set()
+```
+
+**逐层传输变体（Layerwise）**
+
+AscendStore 还提供逐层版本 `KVCacheStoreLayerSendingThread` / `KVCacheStoreLayerRecvingThread`，支持存储读取与模型计算的流水线：
+
+```python
+# pool_worker.py（逐层加载 generator）
+def _retrieve_layerwise(self, req_meta) -> Generator:
+    """
+    把 [block, layer] 的二维 key 转置为 [layer, block]，
+    逐层提交给 RecvingThread，每提交一层就 yield 一次。
+    外层的 wait_for_layer_load() 等待当前层完成后，
+    模型才能执行该层的 Attention 计算。
+    """
+    # keys_2d[block_idx][layer_idx] → 转置为 keys_by_layer[layer_idx][block_idx]
+    keys_by_layer = [list(row) for row in zip(*self._keys_2d[req_id])]
+    for layer_id, layer_keys in enumerate(keys_by_layer):
+        self.kv_layer_recv_thread.add_request(
+            LayerReqMeta(layer_id=layer_id, keys=layer_keys, ...)
+        )
+        yield  # vLLM 主循环: wait_for_layer_load() → 等该层 → 执行 Attention → next()
+```
+
+---
+
+#### 7.6.6 MooncakeDistributedStore 后端
+
+`MooncakeBackend` 封装了底层 `MooncakeDistributedStore` 的复杂性，提供简洁的 `put/get/exists` 接口。
+
+**配置文件（JSON）**
+
+通过环境变量 `MOONCAKE_CONFIG_PATH` 指定配置文件路径：
+
+```json
+{
+    "metadata_server":       "192.168.1.100:2379",
+    "global_segment_size":   68719476736,
+    "local_buffer_size":     4294967296,
+    "protocol":              "ascend",
+    "master_server_address": "192.168.1.100:50051",
+    "device_name":           "ascend"
+}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `metadata_server` | etcd 地址，存储全局 key→local_seg 映射（哪个节点有哪些 block） |
+| `global_segment_size` | 每节点注册给全局池的显存大小（64 GB） |
+| `local_buffer_size` | 本地传输缓冲区大小（4 GB） |
+| `protocol` | 传输协议：`rdma`（InfiniBand）或 `ascend`（华为 HCCS） |
+| `master_server_address` | MooncakeStore master 节点地址（负责传输协调） |
+
+**完整 MooncakeBackend 实现**
+
+```python
+# backend/mooncake_backend.py
+import os, json
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+
+class MooncakeStoreConfig:
+    @classmethod
+    def load_from_env(cls) -> "MooncakeStoreConfig":
+        path = os.environ.get("MOONCAKE_CONFIG_PATH")
+        if not path:
+            raise RuntimeError("MOONCAKE_CONFIG_PATH 未设置")
+        with open(path) as f:
+            data = json.load(f)
+        cfg = cls()
+        cfg.metadata_server       = data["metadata_server"]
+        cfg.global_segment_size   = data["global_segment_size"]
+        cfg.local_buffer_size     = data.get("local_buffer_size", 0)
+        cfg.protocol              = data.get("protocol", "rdma")
+        cfg.master_server_address = data.get("master_server_address", "")
+        cfg.device_name           = data.get("device_name", "")
+        return cfg
+
+class MooncakeBackend(Backend):
+    def __init__(self, parallel_config):
+        cfg = MooncakeStoreConfig.load_from_env()
+
+        # 本地 segment 名（节点唯一标识，写入 etcd 元数据）
+        self.local_seg = (
+            f"{os.uname().nodename}_tp{parallel_config.tp_rank}"
+        )
+
+        # 初始化分布式存储（此时建立与 master 的连接，注册本节点）
+        self.store = MooncakeDistributedStore()
+        self.store.setup(
+            local_seg=self.local_seg,
+            metadata_server=cfg.metadata_server,
+            global_segment_size=cfg.global_segment_size,
+            local_buffer_size=cfg.local_buffer_size,
+            protocol=cfg.protocol,
+            master_server_address=cfg.master_server_address,
+            device_name=cfg.device_name,
+        )
+
+    def register_buffer(self, addr: int, size: int) -> None:
+        """把 GPU/NPU 内存段注册到 RDMA 引擎（一次性操作）"""
+        # 注册后，RDMA PUT/GET 可直接操作这段显存，无需 CPU 中转
+        self.store.register_memory(addr, size)
+
+    def put(self, keys: list[str], addrs: list[int], sizes: list[int]) -> None:
+        """批量写入：GPU 显存 → 全局分布式存储（优先写本地节点）"""
+        rc = ReplicateConfig()
+        rc.preferred_segment         = self.local_seg  # 优先写本地（减少跨节点延迟）
+        rc.prefer_alloc_in_same_node = True
+        self.store.batch_put_from_multi_buffers(keys, addrs, sizes, rc)
+        # 写入后，etcd 元数据自动更新：key → local_seg 映射
+
+    def get(self, keys: list[str], addrs: list[int], sizes: list[int]) -> None:
+        """批量读取：全局分布式存储 → GPU 显存（阻塞直到完成）"""
+        # MooncakeStore 通过 etcd 查询 key 所在节点，自动路由 RDMA
+        self.store.batch_get_into_multi_buffers(
+            keys, addrs, sizes,
+            True,  # blocking=True
+        )
+
+    def exists(self, keys: list[str]) -> list[bool]:
+        """批量检查：key 是否已在全局池中（任意节点上）"""
+        return self.store.batch_is_exist(keys)
+```
+
+**`preferred_segment` 的作用（局部性优化）**
+
+```
+4 节点集群，Node 1 执行 PUT：
+  preferred_segment = "node1_tp0"
+         ↓
+  MooncakeStore 优先将数据存储在 node1 的 global_segment
+         ↓
+  etcd 记录：key → "node1_tp0"
+         ↓
+  其他节点 GET 该 key 时，MooncakeStore 路由到 node1，走 RDMA 读取
+         ↓
+  如果 node1 故障，MooncakeStore 可从副本节点读取（ReplicateConfig 可配多副本）
+```
+
+---
+
+#### 7.6.7 从零手搓完整 AscendStore
+
+有了以上基础，可以按依赖顺序，从底层往上逐步构建一个完整的极简版 AscendStore。
+
+**Step 1：Backend 抽象接口**
+
+```python
+# minimal/backend.py
+from abc import ABC, abstractmethod
+
+class Backend(ABC):
+    @abstractmethod
+    def register_buffer(self, addr: int, size: int) -> None:
+        """向 RDMA 引擎注册 GPU/NPU 显存段"""
+        ...
+
+    @abstractmethod
+    def put(self, keys: list[str], addrs: list[int], sizes: list[int]) -> None:
+        """批量写入（GPU→全局存储）"""
+        ...
+
+    @abstractmethod
+    def get(self, keys: list[str], addrs: list[int], sizes: list[int]) -> None:
+        """批量读取（全局存储→GPU），阻塞直到完成"""
+        ...
+
+    @abstractmethod
+    def exists(self, keys: list[str]) -> list[bool]:
+        """批量检查 key 是否存在于全局池"""
+        ...
+```
+
+**Step 2：MooncakeBackend 实现**
+
+```python
+# minimal/mooncake_backend.py
+import os, json
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from .backend import Backend
+
+class MinimalMooncakeBackend(Backend):
+    def __init__(self, local_seg: str):
+        cfg = json.load(open(os.environ["MOONCAKE_CONFIG_PATH"]))
+        self.local_seg = local_seg
+        self.store     = MooncakeDistributedStore()
+        self.store.setup(
+            local_seg=local_seg,
+            metadata_server=cfg["metadata_server"],
+            global_segment_size=cfg["global_segment_size"],
+            protocol=cfg.get("protocol", "rdma"),
+            master_server_address=cfg.get("master_server_address", ""),
+        )
+
+    def register_buffer(self, addr, size):
+        self.store.register_memory(addr, size)
+
     def put(self, keys, addrs, sizes):
-        config = ReplicateConfig()
-        config.preferred_segment = self.local_seg   # 优先存本地节点
-        self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+        rc = ReplicateConfig()
+        rc.preferred_segment         = self.local_seg
+        rc.prefer_alloc_in_same_node = True
+        self.store.batch_put_from_multi_buffers(keys, addrs, sizes, rc)
 
     def get(self, keys, addrs, sizes):
-        self.store.batch_get_into_multi_buffers(keys, addrs, sizes, blocking=True)
+        self.store.batch_get_into_multi_buffers(keys, addrs, sizes, True)
+
+    def exists(self, keys):
+        return self.store.batch_is_exist(keys)
 ```
 
-注意与 7.5 模拟版的关键区别：
-- `put` 使用的是 **分布式存储**（自动复制、跨节点可访问），而非单节点 Python dict
-- `get` 底层也走 RDMA，延迟远低于模拟版的 `time.sleep()`
-- `ReplicateConfig.preferred_segment` 实现了"优先存本地"的局部性优化
-
-#### 7.6.3 Block 哈希：SHA-256 精确去重
-
-模拟版用 Python `hash(tuple(tokens))`（非安全哈希）。AscendStore 使用 **SHA-256** 精确去重：
+**Step 3：PoolKey 与哈希工具**
 
 ```python
-# kv_transfer.py:166-169
-import hashlib
-key = hashlib.sha256(
-    token_ids.tobytes()            # 将 token id 序列转为字节
-).hexdigest()                      # 十六进制字符串作为 block key
+# minimal/pool_key.py
+import hashlib, dataclasses
+import numpy as np
+
+@dataclasses.dataclass
+class PoolKey:
+    model_name: str
+    tp_rank:    int
+    chunk_hash: bytes   # SHA-256 digest（32 bytes）
+    pp_rank:    int = 0
+
+    def to_string(self) -> str:
+        return (f"{self.model_name}"
+                f"@head:{self.tp_rank}"
+                f"@pp:{self.pp_rank}"
+                f"@{self.chunk_hash.hex()}")
+
+    @staticmethod
+    def hash_tokens(token_ids: list[int]) -> bytes:
+        return hashlib.sha256(
+            np.array(token_ids, dtype=np.int32).tobytes()
+        ).digest()
 ```
 
-SHA-256 的好处：确定性、无碰撞风险，不同节点对相同 token 序列计算出相同的 key，实现**真正的跨节点去重**。
-
-#### 7.6.4 逐层传输（Layerwise）
-
-AscendStore 也支持逐层存取，配合 `KVCacheStoreLayerSendingThread` / `KVCacheStoreLayerRecvingThread`：
+**Step 4：传输线程**
 
 ```python
-# pool_worker.py:357-370
-def retrieve_layer(self, request: ReqMeta) -> Generator:
-    # 转置：从 [block, layer] → [layer, block]
-    keys = [list(row) for row in zip(*keys_2d)]
-    for layer_id, layer_keys in enumerate(keys):
-        req_meta = LayerMultiBlockReqMeta(layer_id=layer_id, keys=layer_keys)
-        self.kv_recv_thread.add_request(req_meta)
-        yield None   # 外层循环调用 wait_for_layer_load() 等待这层完成
+# minimal/transfer.py
+import dataclasses, queue, threading, torch
+from .backend import Backend
+
+@dataclasses.dataclass
+class ReqMeta:
+    req_id: str
+    keys:   list[str]
+    addrs:  list[int]
+    sizes:  list[int]
+    event:  "torch.cuda.Event | None" = None
+
+class SendingThread(threading.Thread):
+    def __init__(self, backend: Backend):
+        super().__init__(daemon=True)
+        self.backend = backend
+        self._q: queue.Queue[ReqMeta | None] = queue.Queue()
+
+    def add(self, meta: ReqMeta)  -> None: self._q.put(meta)
+    def stop(self)                -> None: self._q.put(None)
+
+    def run(self):
+        while True:
+            meta = self._q.get()
+            if meta is None: break
+            # 1. 去重
+            flags = self.backend.exists(meta.keys)
+            new_k, new_a, new_s = [], [], []
+            for k, a, s, f in zip(meta.keys, meta.addrs, meta.sizes, flags):
+                if not f:
+                    new_k.append(k); new_a.append(a); new_s.append(s)
+            if not new_k: continue
+            # 2. 等待 GPU 计算完成
+            if meta.event: meta.event.synchronize()
+            # 3. RDMA PUT
+            self.backend.put(new_k, new_a, new_s)
+
+class RecvingThread(threading.Thread):
+    def __init__(self, backend: Backend):
+        super().__init__(daemon=True)
+        self.backend = backend
+        self._q:    queue.Queue[ReqMeta | None] = queue.Queue()
+        self._done: dict[str, threading.Event]  = {}
+
+    def add(self, meta: ReqMeta) -> threading.Event:
+        ev = threading.Event()
+        self._done[meta.req_id] = ev
+        self._q.put(meta)
+        return ev
+
+    def stop(self) -> None: self._q.put(None)
+
+    def run(self):
+        while True:
+            meta = self._q.get()
+            if meta is None: break
+            self.backend.get(meta.keys, meta.addrs, meta.sizes)
+            ev = self._done.pop(meta.req_id, None)
+            if ev: ev.set()
 ```
 
-每次 `yield` 后，调度器调用 `wait_for_layer_load()`，等待该层 KV 从 Mooncake 存储加载完毕，然后才允许模型执行该层的 Decode attention。这实现了**存储读取与模型计算的流水线**。
+**Step 5：ZMQ Lookup Bridge（Intra-Node）**
 
-#### 7.6.5 本节小结：三种实现对比
+```python
+# minimal/zmq_bridge.py
+import threading
+import zmq
+from .backend import Backend
+
+IPC_PATH = "/tmp/ascend_kv_lookup.ipc"
+
+class LookupServer(threading.Thread):
+    """在 Worker Process 内运行，响应 Scheduler 的查询"""
+    def __init__(self, backend: Backend, ipc_path: str = IPC_PATH):
+        super().__init__(daemon=True)
+        ctx       = zmq.Context()
+        self.sock = ctx.socket(zmq.REP)
+        self.sock.bind(f"ipc://{ipc_path}")
+        self.backend = backend
+
+    def run(self):
+        while True:
+            frames = self.sock.recv_multipart()
+            # frames[0] = token_len（暂时不用）
+            # frames[1:] = hash bytes（每个 32 bytes SHA-256）
+            hashes = frames[1:]
+            keys   = [h.hex() for h in hashes]   # 简化版 key（实际要带 model/rank）
+            flags  = self.backend.exists(keys)
+            # 计算前缀连续命中数（只算首段连续命中）
+            hit = 0
+            for f in flags:
+                if f: hit += 1
+                else: break
+            self.sock.send(hit.to_bytes(8, "little"))
+
+class LookupClient:
+    """在 Scheduler Process 内运行，向 Worker 发起查询"""
+    def __init__(self, ipc_path: str = IPC_PATH):
+        ctx       = zmq.Context()
+        self.sock = ctx.socket(zmq.REQ)
+        self.sock.connect(f"ipc://{ipc_path}")
+
+    def lookup(self, token_len: int, hashes: list[bytes]) -> int:
+        frames = [token_len.to_bytes(8, "little")] + list(hashes)
+        self.sock.send_multipart(frames)
+        reply  = self.sock.recv()
+        return int.from_bytes(reply, "little")
+```
+
+**Step 6：KVPoolWorker**
+
+```python
+# minimal/pool_worker.py
+import threading, torch
+from .backend import Backend
+from .transfer import SendingThread, RecvingThread, ReqMeta
+from .zmq_bridge import LookupServer
+from .pool_key import PoolKey
+
+class MinimalKVPoolWorker:
+    def __init__(self, backend: Backend, model_name: str, tp_rank: int):
+        self.backend    = backend
+        self.model_name = model_name
+        self.tp_rank    = tp_rank
+        self.kv_caches: list[torch.Tensor] = []
+        self.block_bytes = 0
+        self._load_events: dict[str, threading.Event] = {}
+
+        # 启动三个后台组件
+        self.send_thread = SendingThread(backend)
+        self.recv_thread = RecvingThread(backend)
+        self.lookup_srv  = LookupServer(backend)
+        self.send_thread.start()
+        self.recv_thread.start()
+        self.lookup_srv.start()
+
+    def register_kv_caches(self, kv_caches: list[torch.Tensor]) -> None:
+        self.kv_caches   = kv_caches
+        self.block_bytes = (
+            kv_caches[0].element_size()
+            * kv_caches[0][0][0].numel()
+            * len(kv_caches)
+        )
+        for kv in kv_caches:
+            self.backend.register_buffer(kv.data_ptr(), kv.nbytes)
+
+    def _make_keys(self, block_hashes: list[bytes]) -> list[str]:
+        return [PoolKey(self.model_name, self.tp_rank, h).to_string()
+                for h in block_hashes]
+
+    def _make_addrs(self, block_ids: list[int]) -> tuple[list[int], list[int]]:
+        base  = self.kv_caches[0].data_ptr()
+        addrs = [base + bid * self.block_bytes for bid in block_ids]
+        sizes = [self.block_bytes] * len(block_ids)
+        return addrs, sizes
+
+    def start_load_kv(
+        self, block_ids: list[int], block_hashes: list[bytes], req_id: str
+    ) -> threading.Event:
+        keys        = self._make_keys(block_hashes)
+        addrs, szs  = self._make_addrs(block_ids)
+        meta        = ReqMeta(req_id, keys, addrs, szs)
+        ev          = self.recv_thread.add(meta)
+        self._load_events[req_id] = ev
+        return ev
+
+    def wait_for_load(self, req_id: str) -> None:
+        ev = self._load_events.pop(req_id, None)
+        if ev: ev.wait()
+
+    def wait_for_save(
+        self, block_ids: list[int], block_hashes: list[bytes], req_id: str
+    ) -> None:
+        keys       = self._make_keys(block_hashes)
+        addrs, szs = self._make_addrs(block_ids)
+        event      = torch.cuda.Event()
+        event.record()
+        meta = ReqMeta(req_id, keys, addrs, szs, event)
+        self.send_thread.add(meta)
+```
+
+**Step 7：KVPoolScheduler + AscendStoreConnector（胶水层）**
+
+```python
+# minimal/pool_scheduler.py
+import hashlib, numpy as np
+from .zmq_bridge import LookupClient
+from .pool_key import PoolKey
+
+class MinimalKVPoolScheduler:
+    def __init__(self, block_size: int, model_name: str, tp_rank: int):
+        self.block_size = block_size
+        self.model_name = model_name
+        self.tp_rank    = tp_rank
+        self.client     = LookupClient()
+        self._trackers: dict[str, int]         = {}
+        self._hashes:   dict[str, list[bytes]] = {}
+
+    def _compute_hashes(self, token_ids: list[int]) -> list[bytes]:
+        result = []
+        for i in range(0, len(token_ids) - self.block_size + 1, self.block_size):
+            chunk = token_ids[i:i + self.block_size]
+            result.append(PoolKey.hash_tokens(chunk))
+        return result
+
+    def get_num_new_matched_tokens(self, req_id: str, token_ids: list[int]) -> int:
+        hashes = self._compute_hashes(token_ids)
+        self._hashes[req_id] = hashes
+        prev       = self._trackers.get(req_id, 0)
+        new_hashes = hashes[prev:]
+        if not new_hashes:
+            return 0
+        hits = self.client.lookup(len(token_ids), new_hashes)
+        self._trackers[req_id] = prev + hits
+        return hits * self.block_size
+
+    def get_load_spec(self, req_id: str) -> dict:
+        n = self._trackers.get(req_id, 0)
+        return {
+            "num_matched_blocks": n,
+            "block_hashes": self._hashes.get(req_id, [])[:n],
+        }
+
+# minimal/connector.py
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+
+class MinimalAscendStoreConnector(KVConnectorBase_V1):
+    """把 KVPoolScheduler（调度器侧）和 KVPoolWorker（Worker 侧）粘合到 V1 接口"""
+
+    # ── 调度器侧 ────────────────────────────────────────────────────
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        n = self.scheduler.get_num_new_matched_tokens(
+            request.request_id, request.inputs.prompt_token_ids
+        )
+        return n, n > 0
+
+    def update_state_after_alloc(self, request, blocks, num_lookahead_slots):
+        spec = self.scheduler.get_load_spec(request.request_id)
+        spec["block_ids"] = request.get_block_ids()[:spec["num_matched_blocks"]]
+
+    def build_connector_meta(self, request):
+        return self.scheduler.get_load_spec(request.request_id) or None
+
+    def request_finished(self, request, block_ids, success):
+        return None, False  # delay_free=False
+
+    def take_events(self):
+        return []
+
+    # ── Worker 侧 ────────────────────────────────────────────────────
+    def register_kv_caches(self, kv_caches):
+        self.worker.register_kv_caches(kv_caches)
+
+    def start_load_kv(self, scheduler_output, finished_reqs):
+        meta = scheduler_output.connector_metadata
+        if not meta or not meta.get("num_matched_blocks"):
+            return
+        self.worker.start_load_kv(
+            meta["block_ids"], meta["block_hashes"], meta["req_id"]
+        )
+
+    def wait_for_layer_load(self, layer_name):
+        # 简化版：等待所有请求的 KV 加载完成（非逐层）
+        # 生产版使用 LayerRecvingThread 实现逐层流水线
+        for req_id in list(self.worker._load_events):
+            self.worker.wait_for_load(req_id)
+
+    def save_kv_layer(self, layer_name, kv_layer, *args):
+        pass  # AscendStore 在 wait_for_save 批量处理，不逐层
+
+    def wait_for_save(self, request, finished):
+        if not finished:
+            return False
+        spec = self.scheduler.get_load_spec(request.request_id)
+        self.worker.wait_for_save(
+            request.get_block_ids(),
+            spec.get("block_hashes", []),
+            request.request_id,
+        )
+        return False  # delay_free=False
+
+    def get_finished(self, in_flight):
+        return [], []
+```
+
+---
+
+#### 7.6.8 端到端数据流：一次全局池跨节点命中
+
+以下是完整的跨节点 KV 命中场景：Node 0 作为 Prefill 节点计算了系统提示词，Node 1 作为 Decode 节点发起新请求。
+
+```
+═══════════════════════════════════════════════════════════════════
+Node 0（Prefill 节点）：计算并存入全局池
+═══════════════════════════════════════════════════════════════════
+[NPU Stream]        → Attention(sys_prompt) → event.record() → 继续计算
+                                                    ↓ (非阻塞)
+[wait_for_save()]   创建 event，构造 ReqMeta → SendingThread.add(meta)
+[SendingThread]     (1) backend.exists(keys) → 全部 False（首次写入）
+                    (2) event.synchronize()  → 等待 NPU 完成 KV 计算
+                    (3) backend.put(keys, gpu_addrs, sizes)
+                         └→ RDMA WRITE → MooncakeDistributedStore
+                         └→ etcd 更新：key → "node0_tp0"
+
+═══════════════════════════════════════════════════════════════════
+Node 1（Decode 节点）：新请求，命中全局池
+═══════════════════════════════════════════════════════════════════
+
+[Scheduler]    get_num_new_matched_tokens()
+                 → _compute_hashes(sys_prompt_tokens) = [h0, h1, ..., h31]
+                 → LookupClient.lookup(hashes)
+                      → ZMQ REQ → LookupServer（node1 Worker Process）
+                      → backend.exists([key0,...,key31]) → etcd 查询 → 全部 True
+                      → reply = 32
+                 → 返回 32 * block_size 个命中 token ✓
+
+[Scheduler]    update_state_after_alloc() → block_ids = [5,6,...,36]
+               build_connector_meta()     → AscendConnectorMetadata
+
+[Worker]       start_load_kv()
+                 → RecvingThread.add(ReqMeta(keys=[key0..key31], addrs=[...]))
+                 → backend.get(keys, addrs, sizes)
+                      └→ MooncakeStore 通过 etcd 查到 key 在 node0
+                      └→ RDMA READ from node0 GPU → node1 GPU
+                      └→ done_event.set()
+
+[Scheduler]    wait_for_layer_load() → done_event.wait() → 加载完成
+
+[NPU]          直接执行 Prefill Attention（KV 已就位）→ 跳过重计算
+
+═══════════════════════════════════════════════════════════════════
+净效果：32 blocks × block_size tokens 的 Prefill 计算 → 一次 RDMA 传输
+        延迟：从 ~254ms（重算） → ~2ms（RDMA）
+═══════════════════════════════════════════════════════════════════
+```
+
+---
+
+#### 7.6.9 本节小结
 
 | 特性 | 模拟版（7.5） | 上游 MooncakeConnector | vllm-ascend AscendStore |
 |------|--------------|----------------------|------------------------|
 | **范围** | 教学用 | P2P（仅 PD 分离） | 全局 KV 池（所有节点共享） |
-| **存储** | Python dict | 无持久化 | 分布式存储（Mooncake/Memcache） |
-| **哈希** | Python hash() | 无（按 block_id） | SHA-256 精确去重 |
-| **逐层** | ❌ | ❌ | ✅ |
-| **异构 TP** | ❌ | ❌ | ✅ |
-| **多后端** | ❌ | ❌ | ✅ |
+| **存储** | Python dict | 无持久化 | MooncakeDistributedStore (RDMA) |
+| **哈希/去重** | Python hash()（本地） | 无去重（按 block_id） | SHA-256 精确内容寻址 |
+| **跨节点去重** | ❌ | ❌ | ✅（内容寻址 + etcd） |
+| **GPU 同步** | 无（模拟延迟） | asyncio.Event | torch.cuda.Event.synchronize() |
+| **ZMQ 查询** | ❌ | ❌ | ✅ Intra-node 毫秒级 |
+| **逐层流水线** | ❌ | ❌ | ✅ LayerSending/RecvingThread |
+| **delay_free** | ❌ | ✅（P2P 需要） | ❌（全局池不需要） |
+| **多后端** | ❌ | ❌ | ✅ Mooncake / Memcache |
+| **生产就绪** | ❌ | ✅ | ✅ |
 
 ---
 
