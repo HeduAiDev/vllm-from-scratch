@@ -676,33 +676,36 @@ flowchart TD
 
 ### 7.3 Mooncake 真实源码深度解析
 
-> 源码路径：`vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py`
+上游 vLLM 和 vllm-ascend 在传输方向上有根本性的差异，两者都值得深入了解：
 
-#### 7.3.1 架构：不是"发布-查询"，而是"主动推送"
+| | 上游 vLLM | vllm-ascend |
+|--|-----------|-------------|
+| **源码路径** | `vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py` | `vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py` |
+| **传输方向** | P push（RDMA WRITE） | D pull（RDMA READ） |
+| **异构 TP** | ❌ NotImplementedError | ✅ P_tp ≥ D_tp，P_tp % D_tp == 0 |
+| **逐层传输** | ❌ | ✅ LayerwiseConnector |
+| **全局 KV 池** | ❌（仅 P2P） | ✅ AscendStore（见 7.5） |
 
-很多文章把 Mooncake 描述成"D-node 从全局池 pull KV"，但真实实现是**P-node 主动 RDMA WRITE 到 D-node 的内存**。这两种模式有本质区别：
+#### 7.3.1 上游 vLLM：P 主动推送（RDMA WRITE）
+
+很多文章把 Mooncake 描述成"D-node 从全局池 pull KV"，但上游 vLLM 的真实实现是**P-node 主动 RDMA WRITE 到 D-node 的内存**：
 
 ```
-错误理解（RDMA READ，类似 CDN 拉取）：
-  D-node → 查询元数据服务 → 找到 block 在 P-node 的内存地址
-  D-node → 发起 RDMA READ → 从 P-node GPU 内存直接读取
-  (D 控制传输方向)
-
-真实实现（RDMA WRITE，类似主动推送）：
+上游 vLLM（RDMA WRITE，P 控制）：
   D-node → 向 P-node 的 ZMQ side channel 发送请求
-              包含：D-node 的 GPU 内存地址
+              包含：D-node 的 GPU 内存地址（kv_caches_base_addr）
   P-node → Prefill 完成后，从本地 GPU 内存 RDMA WRITE 到 D-node
               engine.batch_transfer_sync_write(src_ptrs, dst_ptrs, lengths)
   (P 控制传输方向)
 ```
 
-**为什么 P 主动写而非 D 主动读？**
+**为什么 P 主动写？**
 
 - P-node 知道精确的传输时机（Prefill 刚完成的那一刻）
 - P-node 掌握 KV 的物理内存地址（block_id × block_len）
 - D-node 不需要知道 P-node 的内存布局细节
 
-#### 7.3.2 核心数据流（逐步拆解源码）
+#### 7.3.2 核心数据流（上游 vLLM，逐步拆解源码）
 
 ```mermaid
 sequenceDiagram
@@ -751,7 +754,7 @@ sequenceDiagram
     end
 ```
 
-#### 7.3.3 关键源码注解
+#### 7.3.3 关键源码注解（上游 vLLM）
 
 **内存注册**（一次性，启动时执行）：
 ```python
@@ -809,17 +812,157 @@ done, pending = await asyncio.wait(wait_tasks, timeout=ABORT_TIMEOUT)
 # P 的 Prefill 完成后 ZMQ 响应立刻就绪，最小化 D-node 等待时间
 ```
 
-#### 7.3.4 与第七章模拟实现的对比
+#### 7.3.4 三种实现对比（模拟 / 上游 vLLM / vllm-ascend）
 
 | 特性 | 模拟实现（global_kv_pool.py） | 真实 Mooncake 实现 |
 |------|------------------------------|-------------------|
 | 元数据服务 | Python dict（单进程内） | 分布式（每个 engine 独立维护） |
-| 传输方向 | submit_transfer（D pull） | RDMA WRITE（P push） |
-| 传输协议 | Python threading sleep | mooncake.engine（RDMA） |
-| P/D 发现 | 预置 node_id | Bootstrap Server（HTTP） |
-| P/D 协调 | wait_for_kv() 同步等 | asyncio.Event + ZMQ |
-| 块地址 | 抽象 block_hash | GPU 物理内存指针 |
-| 块合并 | 无 | group_concurrent_contiguous() |
+| 传输方向 | submit_transfer（D pull） | RDMA WRITE（P push） | RDMA READ（D pull） |
+| 传输协议 | Python threading sleep | mooncake.engine（RDMA） | mooncake.engine（RDMA） |
+| P/D 发现 | 预置 node_id | Bootstrap Server（HTTP） | ZMQ handshake |
+| P/D 协调 | wait_for_kv() 同步等 | asyncio.Event + ZMQ | 异步接收线程 |
+| 块地址 | 抽象 block_hash | GPU 物理内存指针 | GPU NPU 内存指针 |
+| 块合并 | 无 | group_concurrent_contiguous() | 连续块合并 |
+| 异构 TP | ❌ | ❌ | ✅ block 分割 |
+| 逐层传输 | ❌ | ❌ | ✅ |
+
+---
+
+#### 7.3.5 vllm-ascend：D 主动拉取（RDMA READ）
+
+vllm-ascend 使用与上游完全**相反的传输方向**：由 D-node 主动从 P-node 拉取 KV 数据：
+
+```
+vllm-ascend（RDMA READ，D 控制）：
+  P-node → Prefill 完成后，向调度器标记 do_remote_decode=True
+           内存地址已注册到 Mooncake TransferEngine（NPU 内存 pin）
+
+  D-node → 接收到调度决策（知道目标 P-node）
+  D-node → 调用 engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+           直接从 P-node NPU 内存 RDMA READ 到本地 NPU 内存
+  (D 控制传输方向)
+```
+
+核心代码（`kv_p2p/mooncake_connector.py:545-547`）：
+
+```python
+# D-node 主动发起 RDMA READ（与上游 batch_transfer_sync_write 方向相反）
+ret = self.engine.batch_transfer_sync_read(
+    session_id, src_list, dst_list, length_list
+)
+```
+
+**D pull 的优势（在 Ascend 场景下）**：
+- D-node 可以灵活控制何时发起传输，无需 P-node 等待 D 的内存地址
+- 支持异构 TP（一个 D-GPU 从多个 P-GPU 分别读取不同的 head 段）
+- P-node 只需注册内存，无需额外的发送逻辑
+
+**数据流（vllm-ascend）**：
+
+```mermaid
+sequenceDiagram
+    participant P as P-Node (Prefill)
+    participant D as D-Node (Decode)
+
+    rect rgb(220, 240, 255)
+        Note over P,D: Bootstrap 阶段
+        P->>P: batch_register_memory(npu_data_ptrs)<br/>注册 NPU 内存到 Mooncake TransferEngine
+        D->>D: 启动 KVCacheRecvingThread 异步接收线程
+    end
+
+    rect rgb(220, 255, 220)
+        Note over P,D: 请求处理
+        P->>P: Prefill 执行，计算 KV Cache
+        P->>P: request_finished()<br/>标记 do_remote_decode=True<br/>build_connector_meta() 生成传输参数
+
+        D->>D: 接收 SchedulerOutput（含 P-node 地址信息）
+        D->>P: RDMA READ<br/>batch_transfer_sync_read(src_ptrs, dst_ptrs)<br/>从 P-node NPU → D-node NPU
+        D->>D: wait_for_layer_load() 等待完成
+        D->>D: KV 就绪，开始 Decode
+    end
+```
+
+#### 7.3.6 异构 TP 支持：Block 分割机制
+
+vllm-ascend 支持 P 节点与 D 节点使用不同 TP 大小（要求 `P_tp >= D_tp` 且 `P_tp % D_tp == 0`）。
+
+**核心思路**：当 P_tp > D_tp 时，每个 D-GPU 需要覆盖更多的 attention head，因此需要从多个 P-GPU 分别拉取各自负责的 head 段。
+
+**关键计算**（`mooncake_connector.py:1150-1156`）：
+
+```python
+num_d_block_heads = max(1, self.num_key_value_heads // self.tp_size)        # D 每 GPU 的 head 数
+num_p_block_heads = max(1, self.num_key_value_heads // self._prefill_tp_size)  # P 每 GPU 的 head 数
+self.tp_num_need_pulls = num_d_block_heads // num_p_block_heads  # 每个 D-GPU 需要从几个 P-GPU 拉
+```
+
+**Block 分割逻辑**（`mooncake_connector.py:537-552`）：
+
+```python
+inner_block_len = block_len // tp_num_need_pulls  # 每次 RDMA READ 的字节数
+inner_offset = offset % tp_num_need_pulls          # 偏移量，指向当前 P-GPU 的 head 段
+
+for remote_block_id, local_block_id in zip(grouped_remote_ids, grouped_local_ids):
+    src = src_layer_base_addr + local_block_id[0] * block_len + inner_offset * inner_block_len
+    dst = dst_layer_base_addr + remote_block_id[0] * inner_block_len
+    length = inner_block_len * len(local_block_id)
+    src_list.append(src), dst_list.append(dst), length_list.append(length)
+```
+
+**示例（模型 128 heads，P_tp=4，D_tp=2）**：
+
+```
+P_tp=4：每个 P-GPU 存 32 heads 的 KV
+D_tp=2：每个 D-GPU 需要 64 heads 的 KV
+
+tp_num_need_pulls = 64 // 32 = 2
+
+D-GPU_0（heads 0-63）需要：
+  ← RDMA READ 来自 P-GPU_0（heads 0-31，inner_offset=0）
+  ← RDMA READ 来自 P-GPU_1（heads 32-63，inner_offset=1）
+
+D-GPU_1（heads 64-127）需要：
+  ← RDMA READ 来自 P-GPU_2（heads 64-95，inner_offset=0）
+  ← RDMA READ 来自 P-GPU_3（heads 96-127，inner_offset=1）
+```
+
+#### 7.3.7 逐层传输（Layerwise Connector）
+
+`mooncake_layerwise_connector.py` 实现了**层级流水线**传输：Prefill 计算完第 N 层的 KV，立刻 RDMA 传输第 N 层给 D-node，同时 Prefill 继续计算第 N+1 层：
+
+```mermaid
+gantt
+    title Layerwise vs 整体传输 时序对比
+    dateFormat X
+    axisFormat %s
+
+    section 整体传输
+    P 计算所有层        : 0, 6
+    RDMA 传输所有层     : 6, 9
+    D Decode           : 9, 12
+
+    section 逐层传输
+    P 计算 Layer 0     : 0, 2
+    RDMA Layer 0       : 2, 3
+    P 计算 Layer 1     : 2, 4
+    RDMA Layer 1       : 4, 5
+    P 计算 Layer 2     : 4, 6
+    RDMA Layer 2       : 6, 7
+    D Decode (流水线)   : 3, 9
+```
+
+- **整体传输**：Prefill 全部完成才开始 RDMA，D-node 等待时间长
+- **逐层传输**：Prefill 每完成一层立刻传输，D-node 提前开始执行已收到的层
+
+逐层传输通过 Python generator 实现（`pool_worker.py:357-424`）：
+
+```python
+def retrieve_layer(self, request) -> Generator:
+    keys = [list(row) for row in zip(*keys)]  # 转置为 [num_layer, num_block]
+    for layer_id, layer_keys in enumerate(keys):
+        self.kv_recv_thread.add_request(layer_keys)
+        yield None  # 每层 yield 一次，让上层 wait_for_layer_load() 同步
+```
 
 ### 7.4 RDMA 从零到懂——完整技术指南
 
@@ -1256,6 +1399,132 @@ def wait_for_kv(self, request_id: str, timeout: float = 5.0) -> bool:
   命中率：66.7%（2/3 的请求完全命中系统提示词）
   节省计算：254ms × 2 = 508ms
 ```
+
+### 7.6 vllm-ascend AscendStore：真实全局 KV 池实现
+
+> 源码路径：`vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/`
+
+7.5 节的模拟实现揭示了全局 KV 池的设计原理。vllm-ascend 的 **AscendStore** 是真实生产中的全局 KV 池实现，结构更为复杂，但核心逻辑与模拟版一一对应。
+
+#### 7.6.1 整体架构
+
+```mermaid
+flowchart TD
+    subgraph Engine0["Node 0（任意角色）"]
+        SC0["AscendStoreConnector<br/>Scheduler 侧"]
+        WK0["AscendStoreConnector<br/>Worker 侧"]
+        PS0["KVPoolScheduler<br/>ZMQ lookup 客户端"]
+        PW0["KVPoolWorker<br/>存取线程"]
+        SC0 --> PS0
+        WK0 --> PW0
+    end
+
+    subgraph Engine1["Node 1"]
+        SC1["AscendStoreConnector"] --> PS1["KVPoolScheduler"]
+        WK1["AscendStoreConnector"] --> PW1["KVPoolWorker"]
+    end
+
+    subgraph Backend["存储后端"]
+        MC["MooncakeDistributedStore<br/>（分布式 KV 存储）"]
+        MEM["MemcacheBackend<br/>（内存缓存，测试用）"]
+    end
+
+    PS0 <-->|"ZMQ RPC<br/>lookup(block_hashes)"| PS1
+    PW0 <-->|"RDMA<br/>put/get"| MC
+    PW1 <-->|"RDMA<br/>put/get"| MC
+    MC -.->|备选| MEM
+```
+
+与 7.5 模拟版的对应关系：
+
+| 模拟版 | AscendStore | 职责 |
+|--------|-------------|------|
+| `GlobalMetadataServer` | `KVPoolScheduler` + ZMQ RPC | 查询哪个节点有哪些 block |
+| `TransferEngine` | `KVPoolWorker` + 传输线程 | 执行实际 KV 读写 |
+| `MooncakeConnector.publish_kv()` | `save_kv_layer()` | 存 KV 到全局池 |
+| `MooncakeConnector.wait_for_kv()` | `wait_for_layer_load()` | 等待 KV 加载完成 |
+
+#### 7.6.2 多后端设计
+
+AscendStore 抽象了存储后端，支持热插拔：
+
+```python
+# pool_worker.py:135-141
+backend_map = {
+    "mooncake": MooncakeBackend,    # 分布式 RDMA 存储（生产首选）
+    "memcache": MemcacheBackend,    # 内存缓存（测试/小集群）
+}
+self.backend = backend_map[config.backend_type]()
+```
+
+**MooncakeBackend**（`backend/mooncake_backend.py`）：
+
+```python
+class MooncakeBackend(Backend):
+    def __init__(self, parallel_config):
+        self.store = MooncakeDistributedStore()
+        self.store.setup(
+            local_seg=local_segment,
+            metadata_server=metadata_server_addr,
+            global_segment_size=global_seg_size,
+            transfer_engine=transfer_engine,
+        )
+
+    def put(self, keys, addrs, sizes):
+        config = ReplicateConfig()
+        config.preferred_segment = self.local_seg   # 优先存本地节点
+        self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+
+    def get(self, keys, addrs, sizes):
+        self.store.batch_get_into_multi_buffers(keys, addrs, sizes, blocking=True)
+```
+
+注意与 7.5 模拟版的关键区别：
+- `put` 使用的是 **分布式存储**（自动复制、跨节点可访问），而非单节点 Python dict
+- `get` 底层也走 RDMA，延迟远低于模拟版的 `time.sleep()`
+- `ReplicateConfig.preferred_segment` 实现了"优先存本地"的局部性优化
+
+#### 7.6.3 Block 哈希：SHA-256 精确去重
+
+模拟版用 Python `hash(tuple(tokens))`（非安全哈希）。AscendStore 使用 **SHA-256** 精确去重：
+
+```python
+# kv_transfer.py:166-169
+import hashlib
+key = hashlib.sha256(
+    token_ids.tobytes()            # 将 token id 序列转为字节
+).hexdigest()                      # 十六进制字符串作为 block key
+```
+
+SHA-256 的好处：确定性、无碰撞风险，不同节点对相同 token 序列计算出相同的 key，实现**真正的跨节点去重**。
+
+#### 7.6.4 逐层传输（Layerwise）
+
+AscendStore 也支持逐层存取，配合 `KVCacheStoreLayerSendingThread` / `KVCacheStoreLayerRecvingThread`：
+
+```python
+# pool_worker.py:357-370
+def retrieve_layer(self, request: ReqMeta) -> Generator:
+    # 转置：从 [block, layer] → [layer, block]
+    keys = [list(row) for row in zip(*keys_2d)]
+    for layer_id, layer_keys in enumerate(keys):
+        req_meta = LayerMultiBlockReqMeta(layer_id=layer_id, keys=layer_keys)
+        self.kv_recv_thread.add_request(req_meta)
+        yield None   # 外层循环调用 wait_for_layer_load() 等待这层完成
+```
+
+每次 `yield` 后，调度器调用 `wait_for_layer_load()`，等待该层 KV 从 Mooncake 存储加载完毕，然后才允许模型执行该层的 Decode attention。这实现了**存储读取与模型计算的流水线**。
+
+#### 7.6.5 本节小结：三种实现对比
+
+| 特性 | 模拟版（7.5） | 上游 MooncakeConnector | vllm-ascend AscendStore |
+|------|--------------|----------------------|------------------------|
+| **范围** | 教学用 | P2P（仅 PD 分离） | 全局 KV 池（所有节点共享） |
+| **存储** | Python dict | 无持久化 | 分布式存储（Mooncake/Memcache） |
+| **哈希** | Python hash() | 无（按 block_id） | SHA-256 精确去重 |
+| **逐层** | ❌ | ❌ | ✅ |
+| **异构 TP** | ❌ | ❌ | ✅ |
+| **多后端** | ❌ | ❌ | ✅ |
 
 ---
 
