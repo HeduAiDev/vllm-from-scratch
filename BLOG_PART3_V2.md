@@ -1101,84 +1101,171 @@ class KVConnectorBase_V1(ABC):
 > - **7.3.7**：逐层传输（Layerwise Connector）
 > - **7.6**：vllm-ascend AscendStore 分布式 KV 池
 
-此处给出一个简化版示意，帮助理解整体思路：
+此处重点厘清 **V0 vs V1 接口演进**，以及 MooncakeConnector（P2P）与 LMCache（全局存储池）的本质区别：
 
-Mooncake 实现了 KVConnectorBase_V1，将 KV Cache 以 block 为单位存入分布式 KV Store：
+##### V0 接口（历史，已废弃）
+
+V0 的 `KVConnectorBase` 使用一对**同步阻塞**方法，通过中间 **KV Lookup Buffer**（按 token hash 键值存取）协调 P/D 传输顺序：
 
 ```python
-# 简化的 Mooncake Connector 工作逻辑
-
-class MooncakeConnector(KVConnectorBase_V1):
-    """
-    通过 Mooncake Store（RDMA 分布式 KV 存储）传输 KV Cache
-
-    关键特性：
-    - 按 block_hash 存储：自动支持 Prefix Cache（相同前缀不重复传输）
-    - 异步传输：不阻塞模型推理
-    - RDMA 零拷贝：GPU→网卡→GPU，无 CPU 介入
-    """
+# vLLM V0 KVConnector 接口（已废弃，勿与 V1 混淆！）
+class KVConnectorBase:  # V0
 
     def send_kv_caches_and_hidden_states(
         self, model_executable, model_input, kv_caches, hidden_states
-    ):
-        # 遍历需要发送的 blocks
-        for layer_id, kv_cache in enumerate(kv_caches):
-            for block_hash, physical_block_id in self._blocks_to_send(model_input):
-                k = kv_cache[0][physical_block_id]  # [block_size, H, head_dim]
-                v = kv_cache[1][physical_block_id]
-
-                # 按 block_hash 存入 Mooncake Store（RDMA 注册内存）
-                key = f"kv/{block_hash}/layer{layer_id}"
-                self.store.put(key, torch.stack([k, v]))
-                # ↑ 这步触发 RDMA 注册，D-Node 可以直接远程读取
+    ) -> None:
+        """P-Node：Prefill 全部完成后，将 KV Cache 写入中间 KV Lookup Buffer"""
+        # 底层分两层：
+        #   KV Pipe：FIFO 张量管道（send_tensor / recv_tensor）
+        #   KV Lookup Buffer：在 Pipe 之上，API: insert(token_hash, kv) / drop_select(token_hash)
+        # P 按 token_hash 发布 KV，解决 P/D 处理顺序不一致问题（P 先完成，D 后到）
+        ...
 
     def recv_kv_caches_and_hidden_states(
         self, model_executable, model_input, kv_caches
-    ):
-        # D-Node：从 Mooncake Store 拉取 KV（触发 RDMA READ）
-        for layer_id, kv_cache in enumerate(kv_caches):
-            for block_hash, local_block_id in self._blocks_to_recv(model_input):
-                key = f"kv/{block_hash}/layer{layer_id}"
-                kv_data = self.store.get(key)  # RDMA READ
-
-                k, v = kv_data[0], kv_data[1]
-                kv_cache[0][local_block_id] = k
-                kv_cache[1][local_block_id] = v
-
-        # bypass_model=True：KV 已就绪，直接做 decode attention，不需要重新 prefill
-        return None, True
+    ) -> tuple[Tensor, bool]:
+        """D-Node：从 KV Lookup Buffer 按 token_hash 取出 KV，填入本地 blocks"""
+        ...
+        # 返回 bypass_model=True → D-Node 跳过 Prefill 前向传播，直接进行 Decode Attention
+        return hidden_states, True
 ```
 
-#### 13.3.4 端到端请求流程
+**V0 的局限**：
+- Prefill 全部完成才开始传输，D-Node 等待时间等于完整 Prefill 时延
+- 调度器对 KV 传输状态完全无感知，无法提前规划 token budget
+- 无块生命周期控制（无 `delay_free` 机制），块可能在 RDMA 完成前就被释放
 
+##### V1 MooncakeConnector：P2P 直连，无中间存储
+
+V1 的 `MooncakeConnector`（上游 vLLM，详见《博客第二部分》7.3）**不是全局 KV Store**，也不按 block_hash 查找，而是 P-Node 直接通过 RDMA WRITE 写入 D-Node 的 GPU 内存：
+
+```python
+# V1 MooncakeConnector 关键调用链（P-Node 侧）
+
+# ① 调度器侧：Prefill 完成，记录待发 blocks，延迟释放
+def request_finished(self, request, block_ids) -> tuple[bool, dict]:
+    transfer_id = uuid.uuid4().hex
+    self._reqs_need_send[request.request_id] = (transfer_id, list(block_ids))
+    # delay_free=True：blocks 不立即释放，RDMA WRITE 完成后由 get_finished() 触发释放
+    return True, {"do_remote_decode": True, "transfer_id": transfer_id}
+
+# ② 后台 sender_loop：等到 D-Node 通过 ZMQ 发来 GPU 内存地址，执行 RDMA WRITE
+def _send_kv_to_decode(self, d_req_id, pull_meta):
+    src_ptrs, dst_ptrs, lengths = self._build_transfer_params(pull_meta)
+    # P-GPU → D-GPU：直接 RDMA WRITE，无任何中间存储
+    ret = self.engine.batch_transfer_sync_write(
+        remote_session, src_ptrs, dst_ptrs, lengths
+    )
 ```
-时序图（PD 分离完整流程）：
 
-  时刻    Prefill Node (P-Node)        Decode Node (D-Node)
-  ────────────────────────────────────────────────────────────
-  t=0:    接收请求 req_A（4096 tokens）
-          Scheduler 分配 KV blocks
+```python
+# V1 MooncakeConnector 关键调用链（D-Node 侧）
 
-  t=0~2s: Prefill Forward Pass
-          计算并填充 KV Cache blocks
+# ① 调度器侧：查询 P-Node 可提供的 token 数，is_async=True 表示异步传输
+def get_num_new_matched_tokens(self, request, num_computed_tokens):
+    if request.kv_transfer_params.get("do_remote_prefill"):
+        extra = len(request.prompt_token_ids) - num_computed_tokens
+        return extra, True  # 调度器据此分配足够的 KV blocks
+    return 0, False
 
-  t=2s:   KVConnector.send_kv_caches()
-          → 按 block_hash 存入 Mooncake  → 接收通知（block_hash 列表）
-          → 异步 RDMA 传输开始           → 发起 RDMA READ
+# ② Worker 侧：通过 ZMQ 把 D 的 GPU block 地址告知 P，触发 P 的 RDMA WRITE
+def start_load_kv(self, forward_context, **kwargs):
+    for remote_engine_id, pull_metas in metadata.reqs_to_recv.items():
+        asyncio.create_task(
+            self._receive_kv_from_single_worker(remote_engine_id, pull_metas)
+        )
+    # D-Node 进入 WAITING_FOR_REMOTE_KVS 状态，等待 RDMA WRITE 写入完成
 
-  t=2s~   P-Node 开始下一个请求          等待 RDMA 完成（~100ms）
-  t=2.1s: （P-Node 已不关心 req_A）
-                                         RDMA 完成，KV blocks 就绪
-                                         Scheduler: req_A → Decode 队列
-  t=2.1s~                                Decode Forward（逐 token）
-  t=2.6s:                                生成 128 tokens 完成
-  ────────────────────────────────────────────────────────────
-
-关键优势：
-  1. P-Node 在 t=2s 后立即可以服务下一个请求（吞吐 ↑）
-  2. D-Node 可同时服务多个 req 的 decode（延迟 ↓）
-  3. P-Node 和 D-Node 可以用不同硬件配置
+# ③ Worker 侧：轮询 RDMA 完成状态，通知调度器该请求可以进入 Decode
+def get_finished(self, finished_req_ids):
+    return self.finished_sending_reqs.pop(), self.finished_recving_reqs.pop()
 ```
+
+> **注意**：V1 MooncakeConnector 中 `save_kv_layer()` 和 `wait_for_layer_load()` 均为 **No-op**，因为 Mooncake 是整批传输（Prefill 完成后触发，非逐层）。逐层传输由 vllm-ascend 的 LayerwiseConnector 实现（见《博客第二部分》7.3.7）。
+
+##### V1 LMCacheConnector：真正的全局 KV Pool
+
+如果需要**跨 P 节点**的 Prefix Cache 复用（任意 P 写入，任意 D 读取），应使用 **LMCacheConnector**（`vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py`）：
+
+```python
+# LMCache V1：分层 KV 存储（GPU → CPU DRAM → NVMe SSD → 网络存储）
+class LMCacheConnectorV1(KVConnectorBase_V1):
+
+    def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
+        # P-Node：每层 attention 计算后，立刻写入 LMCache（按 block_hash 索引）
+        # 任意 D-Node 都能从 LMCache 读取任意 P-Node 计算过的 KV
+        self._lmcache_engine.save_kv_layer(layer_name, kv_layer, attn_metadata)
+
+    def wait_for_layer_load(self, layer_name):
+        # D-Node：每层 attention 前，等待该层从 LMCache 加载完成
+        self._lmcache_engine.wait_for_layer_load(layer_name)
+```
+
+**三种传输机制对比**：
+
+| 维度 | V0（已废弃） | V1 MooncakeConnector | V1 LMCacheConnector |
+|------|------------|----------------------|---------------------|
+| 核心接口 | `send/recv_kv_caches_and_hidden_states` | `KVConnectorBase_V1` 调度器/Worker 分离 | `KVConnectorBase_V1` |
+| 传输中间层 | KV Lookup Buffer（按 token hash） | 无（P 直写 D GPU 内存，P2P） | LMCache 分层存储（GPU/CPU/NVMe） |
+| 跨 P 节点复用 | 依赖 KV Lookup Buffer 实现 | ❌（固定 P→D 配对） | ✅（任意 P 写，任意 D 读） |
+| `save_kv_layer` | — | No-op | 主动写入 LMCache（逐层） |
+| `wait_for_layer_load` | — | No-op（整批到达） | 主动等待 LMCache 返回 |
+| 调度器感知 | ❌ | ✅ `get_num_new_matched_tokens` | ✅ `get_num_new_matched_tokens` |
+| D-Node 跳过 Prefill | `bypass_model=True` 返回值 | `WAITING_FOR_REMOTE_KVS` 状态机 | `WAITING_FOR_REMOTE_KVS` 状态机 |
+| 延迟 | 较高（整批 + 中间 Buffer） | 最低（直接 RDMA，~100μs） | 较高（存储层，但异步隐藏） |
+| 适合场景 | — | 低延迟，特定 P→D 精确配对 | 大容量 Prefix Pool，多 P 共享 |
+
+#### 13.3.4 端到端请求流程（V1 MooncakeConnector）
+
+```mermaid
+sequenceDiagram
+    participant Router as 路由器
+    participant PS as P-Node 调度器
+    participant PW as P-Node Worker
+    participant DS as D-Node 调度器
+    participant DW as D-Node Worker
+
+    Router->>PS: req_A（do_remote_decode=True）
+    Router->>DS: req_A（do_remote_prefill=True,<br/>transfer_id, P 地址）
+
+    rect rgb(220, 240, 255)
+        Note over PS,DS: t=0 调度阶段（并发）
+        PS->>PS: get_num_new_matched_tokens → 0<br/>分配 KV blocks
+        DS->>DS: get_num_new_matched_tokens → N tokens, is_async=True<br/>分配 KV blocks（预留给 P 传入）
+    end
+
+    rect rgb(220, 255, 220)
+        Note over PW: t=0~2s P-Node Prefill
+        PW->>PW: Prefill Forward Pass<br/>计算并填充 KV Cache blocks
+        PW->>PW: request_finished()<br/>delay_free=True（blocks 不释放）<br/>send_meta.ready.set()
+    end
+
+    rect rgb(255, 240, 200)
+        Note over DW: t=0~ D-Node 并发准备
+        DW->>DW: start_load_kv()<br/>向 P-Node ZMQ 发送 MooncakeXferMetadata<br/>（D 的 GPU block 地址 + transfer_id）
+        DW->>DW: 进入 WAITING_FOR_REMOTE_KVS 状态
+    end
+
+    rect rgb(255, 220, 220)
+        Note over PW: t=2s P-Node 发起 RDMA WRITE
+        PW->>PW: sender_loop：收到 ZMQ 请求<br/>等待 send_meta.ready（Prefill 完成后已触发）
+        PW->>DW: batch_transfer_sync_write()<br/>P-GPU → D-GPU（RDMA WRITE，~100μs）
+        PW->>PS: get_finished() → finished_sending<br/>P-Node blocks 释放，开始处理下一请求
+    end
+
+    rect rgb(240, 220, 255)
+        Note over DS,DW: t=2.1s D-Node 开始 Decode
+        DW->>DS: get_finished() → finished_recving<br/>req_A → RUNNING 状态
+        DS->>DS: 调度 req_A 进入 Decode 批次
+        DW->>DW: Decode Forward（逐 token 生成）
+    end
+```
+
+**关键优势**：
+1. P-Node 在 t=2s 后立即释放 blocks、服务下一请求（吞吐 ↑）
+2. D-Node 的 ZMQ 请求与 P-Node 的 Prefill **并发**进行，最小化等待时间
+3. P-Node 通过 `delay_free=True` 确保 blocks 在 RDMA WRITE 完成前不被驱逐
+4. D-Node 调度器通过 `get_num_new_matched_tokens` 提前分配好 KV blocks，RDMA 完成即可直接 Decode
 
 #### 13.3.5 MLA + PD 分离：传输格式的特殊处理
 

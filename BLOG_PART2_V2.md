@@ -649,6 +649,10 @@ docker exec vllm python3 -m pytest /mnt/esfs/master_work/vllm-from-scratch/02_kv
 
 ### 7.2 全局 KV Cache 池的架构
 
+> **架构说明**：本节展示的是**全局池化的理想架构模型**（即 7.5 节模拟实现所对应的设计）。实际实现中存在两类方案，核心区别如下：
+> - **上游 vLLM MooncakeConnector**（7.3.1）：**无中心元数据服务器**，P 直接 RDMA WRITE 到 D 的 GPU 内存（P2P），不按 block_hash 存取
+> - **LMCache / vllm-ascend AscendStore**（7.6）：有分布式存储层，按 block_hash 索引，支持跨节点前缀复用（真正的"全局池化"）
+
 ```mermaid
 flowchart TD
     MS["全局 Metadata Server<br/>etcd/Redis<br/>block_hash → node_id, memory_addr, size, access_time<br/>API: publish() / query() / invalidate()"]
@@ -674,6 +678,16 @@ flowchart TD
     style STORE fill:#f8d7da,stroke:#721c24
 ```
 
+**三类实现对比**：
+
+| | 上游 vLLM MooncakeConnector | LMCache V1 | vllm-ascend AscendStore |
+|--|------------------------------|------------|--------------------------|
+| 元数据服务 | 无（P2P，无中心服务） | LMCache 引擎（内置） | KVPoolScheduler（ZMQ RPC） |
+| KV 索引方式 | `transfer_id`（请求级配对） | `block_hash`（内容寻址） | `SHA-256(token_ids)` |
+| 跨 P 节点复用 | ❌ | ✅ | ✅ |
+| 传输方向 | P RDMA WRITE → D | D 从 LMCache 存储层读取 | D 从后端（Mooncake/Memcache）拉取 |
+| 冷缓存层 | ❌ | ✅ CPU/NVMe 分层 | ✅ 可插拔后端 |
+
 ### 7.3 Mooncake 真实源码深度解析
 
 上游 vLLM 和 vllm-ascend 在传输方向上有根本性的差异，两者都值得深入了解：
@@ -684,7 +698,7 @@ flowchart TD
 | **传输方向** | P push（RDMA WRITE） | D pull（RDMA READ） |
 | **异构 TP** | ❌ NotImplementedError | ✅ P_tp ≥ D_tp，P_tp % D_tp == 0 |
 | **逐层传输** | ❌ | ✅ LayerwiseConnector |
-| **全局 KV 池** | ❌（仅 P2P） | ✅ AscendStore（见 7.5） |
+| **全局 KV 池** | ❌（仅 P2P） | ✅ AscendStore（见 7.6） |
 
 #### 7.3.1 上游 vLLM：P 主动推送（RDMA WRITE）
 
