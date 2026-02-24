@@ -208,37 +208,62 @@ t=7: 请求D需要更多块，触发驱逐
 - `ref_cnt == 0`：块在 LRU 队列中，**等待**复用，暂时保留（Prefix Cache）
 - 驱逐**不是主动**触发的：当 `get_new_blocks()` 被调用且队列中有旧块时，旧块被弹出覆盖
 
+**Decode 阶段的 block 也会被缓存**：上面 t=2 的示例仅展示 Prefill 阶段。但如果 decode 步骤持续生成 token，一旦某个 block 积累满 `block_size` 个 token，`cache_blocks()` 同样会被触发，该 block 同样会被哈希并写入 `cached_blocks`。
+
+```python
+# single_type_kv_cache_manager.py — allocate_slots 每步（包括 decode）都调用 cache_blocks()
+def cache_blocks(self, request: Request, num_tokens: int) -> None:
+    num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+    num_full_blocks = num_tokens // self.block_size  # 只缓存完整的块
+    if num_cached_blocks >= num_full_blocks:
+        return  # 没有新的满块，跳过
+    self.block_pool.cache_full_blocks(...)
+    self.num_cached_block[request.request_id] = num_full_blocks
+```
+
+因此，无论是 Prefill 还是 Decode，**凡是填满完整 block 的 token，都会被哈希缓存**，供后续请求的 Prefix Cache 复用（例如超长 system prompt 跨越 decode 阶段时）。
+
 #### Q2：链式哈希会出现前面的 block 被驱逐而后面没有的情况吗？
 
-**会！** 这是 LRU 策略的已知代价，称为"孤儿块"（orphaned block）问题：
+**不会**——vLLM 的 `free()` 实现使用了**反转释放顺序**，在设计上避免了这种情况。
 
-```
-场景：100 个块的池，缓存了一个 3 块的系统提示词 [H0→B3, H1→B7, H2→B12]
+**关键代码**（`single_type_kv_cache_manager.py`）：
 
-假设系统负载很高，驱逐顺序取决于 LRU 时间戳（而非哈希链顺序）
-
-可能的驱逐顺序：
-  B3 (H0) 最旧 → 被驱逐
-  cached_blocks 变为：{ H1 → B7, H2 → B12 }
-
-新请求 E 到达（相同系统提示词）：
-  query: H0 → MISS → break！
-  返回 0 个命中块
-
-  H1 → B7 和 H2 → B12 虽然还在缓存中，但永远不会被匹配到！
-  它们成为"孤儿块"：占用 KV Cache 空间，却永远不能被复用
+```python
+def free(self, request_id: str) -> None:
+    req_blocks = self.req_to_blocks.pop(request_id, [])
+    # 反转顺序：先释放尾部 block，再释放头部 block
+    ordered_blocks = reversed(req_blocks)   # ← 关键！
+    self.block_pool.free_blocks(ordered_blocks)
 ```
 
-**为什么 vLLM 接受这个设计缺陷？**
+注释原文："Free blocks in reverse order so that the **tail blocks are freed first**."
 
-1. **简单性**：LRU 是 O(1) 的全局策略，不需要追踪块之间的链式依赖
-2. **自然修复**：孤儿块也会被 LRU 驱逐（它们的访问时间早于新块），最终被清理
-3. **低概率**：热门前缀（如系统提示词）会被频繁访问，访问时间会刷新，不容易被驱逐
-4. **正确性不受影响**：孤儿块只是浪费空间，不会导致计算错误
+**为什么反转顺序就能防止孤儿块？**
 
-**改进方案**（vLLM 未实现但理论上可行）：
-- "链式驱逐"：驱逐 H0 时，同时驱逐所有以 H0 为祖先的块（H1, H2）
-- 代价：需要维护反向索引（parent_hash → [child_hashes]），增加复杂度
+设请求拥有块链 `[H0, H1, H2]`（H0=系统提示词，H2=最后一块）：
+
+```
+释放顺序（reversed）：[H2, H1, H0]
+append_n([H2, H1, H0]) 依次追加到 free_block_queue 尾部
+
+free_block_queue（HEAD 驱逐 → TAIL 最新）：
+  ... → H2 → H1 → H0 → TAIL
+            ↑最旧      ↑最新（最后驱逐）
+```
+
+- H2（链尾）离 HEAD 最近 → **最先被驱逐**
+- H0（链头/系统提示词）离 TAIL 最近 → **最后被驱逐**
+
+驱逐顺序与哈希链方向**完全相反**：总是先驱逐"叶子"，再驱逐"根"。
+
+**再加上 touch 操作的加持**：
+
+每次新请求命中 H0（缓存命中），`touch(H0)` 将 H0 从队列中移除（`ref_cnt++`）。请求结束后 H0 再被追加到 TAIL（最新位置）。因此 H0 的 LRU 位置会随命中而持续刷新，始终保持最新。
+
+**结论**：在 vLLM 的实现中，"孤儿块"（前驱被驱逐、后继仍在缓存）**在设计上不会发生**。驱逐顺序是完全确定的，不存在随机性：同一链中，后面的 block 总比前面的 block 更早被驱逐。
+
+> **注**：`02_kvcache/block_pool_lru.py`（本教程的简化实现）为了教学清晰，没有使用反转释放顺序，因此在简化版中理论上可能出现孤儿块。但真实 vLLM 代码明确规避了这一问题。
 
 #### Q3：为什么必须从头匹配前缀，不能从后往前找第一个命中？
 
@@ -328,17 +353,31 @@ P 节点（TP=4）→ D 节点（TP=4）：
   P.GPU_2 → 通过 RDMA WRITE → D.GPU_2（head 64-95）
   P.GPU_3 → 通过 RDMA WRITE → D.GPU_3（head 96-127）
   共 4 个并行 RDMA 传输
-
-当前限制（Mooncake Connector 源码中明确）：
-  - P.TP_size == D.TP_size 才能直接传输
-  - P.TP=4, D.TP=2 → 不支持（NotImplementedError）
-  - 原因：每张 GPU 的块大小不同，内存地址映射不同
-
-Pipeline Parallelism（PP）：
-  当前 Mooncake Connector 完全不支持 PP（源码中 ValueError）
-  原因：PP 将不同层分到不同 GPU，KV Cache 按层分布，
-        跨 PP 节点的元数据管理更复杂
 ```
+
+**TP 支持现状**（以 Mooncake Connector 为例）：
+
+| 场景 | 上游 vLLM | vllm-ascend |
+|------|----------|-------------|
+| P.TP == D.TP | ✅ 支持 | ✅ 支持 |
+| P.TP > D.TP，且 P.TP % D.TP == 0 | ❌ NotImplementedError | ✅ 支持 |
+| P.TP < D.TP 或不整除 | ❌ | ❌ |
+| PP（Pipeline Parallelism）| ❌ ValueError | ❌ |
+
+上游 vLLM 源码（`mooncake_connector.py`）：
+```python
+def resolve_need_send(self, send_meta, remote_tp_ranks):
+    send_meta.need_send = len(remote_tp_ranks)
+    if send_meta.need_send != 1:
+        logger.error("Mooncake: Heterogeneous TP is not supported yet.")
+        raise NotImplementedError(
+            "Mooncake: Heterogeneous TP is not supported yet."
+        )
+```
+
+vllm-ascend 的 DeepSeek-V3.1 PD 分离部署示例中，P 节点使用 tp=8，D 节点使用 tp=1（整除关系），均属支持范围。
+
+PP 不支持的原因：PP 将不同 Transformer 层分到不同 GPU，KV Cache 按层分布，跨 PP 节点的元数据管理和 RDMA 地址计算更复杂，目前两个版本均未实现。
 
 ---
 
