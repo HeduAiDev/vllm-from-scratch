@@ -31,28 +31,21 @@
 
 实现前缀缓存，核心是一个**前缀树（Trie / Radix Tree）**数据结构。
 
-```
-场景：3 个请求的 token 序列
+```mermaid
+flowchart TD
+    R([root]) --> SYS["[SYS]\ncached block: #7\nref_count=3"]
+    SYS --> Q1["[Q1]\nBlock #12\nref_count=2"]
+    SYS --> Q2["[Q2]\n独立块"]
+    Q1 --> Q1a["[Q1_a]\n请求A独立块"]
+    Q1 --> Q1c["[Q1_c]\n请求C独立块"]
+    Q2 --> Q2b["[Q2_b]\n请求B独立块"]
 
-请求A：[SYS] [Q1] [Q1_a]
-请求B：[SYS] [Q2] [Q2_b]
-请求C：[SYS] [Q1] [Q1_c]
-
-Radix Tree 表示：
-         root
-          │
-        [SYS]──────────────(cached block: #7)
-          │
-     ┌────┴─────┐
-  [Q1]        [Q2]
-   │            │
- ┌─┴──┐       [Q2_b]
-[Q1_a][Q1_c]
-
-共享的物理块：
-  [SYS] → Block #7（所有3个请求共享，ref_count=3）
-  [Q1]  → Block #12（请求A和C共享，ref_count=2）
-  其余  → 各自独立的块
+    style SYS fill:#d4edda,stroke:#28a745
+    style Q1 fill:#d4edda,stroke:#28a745
+    style Q1a fill:#fff3cd,stroke:#ffc107
+    style Q1c fill:#fff3cd,stroke:#ffc107
+    style Q2 fill:#fff3cd,stroke:#ffc107
+    style Q2b fill:#fff3cd,stroke:#ffc107
 ```
 
 vLLM 的实现没有用严格的 Radix Tree，而是用**块级哈希**近似实现同样的效果：
@@ -71,30 +64,20 @@ vLLM 的实现没有用严格的 Radix Tree，而是用**块级哈希**近似实
 
 #### 6.3.1 整体架构
 
-```
-vLLM Prefix Cache 架构（单机版）：
+```mermaid
+flowchart TD
+    KVM["KVCacheManager\nallocate_slots(request, num_new_tokens):\n1. compute_block_hashes(request.tokens)\n2. For each hash: get_cached() or allocate_new()\n3. 返回 slot_mapping"]
 
-  ┌──────────────────────────────────────────────────────┐
-  │                   KVCacheManager                     │
-  │                                                      │
-  │  ┌─────────────────────────────────────────────┐    │
-  │  │              BlockPool                       │    │
-  │  │                                             │    │
-  │  │  free_block_queue（LRU 双向链表）:           │    │
-  │  │  [oldest] ↔ B3 ↔ B7 ↔ B1 ↔ [newest]       │    │
-  │  │                                             │    │
-  │  │  cached_blocks（哈希表）:                   │    │
-  │  │  { H0 → Block#7, H1 → Block#23, ... }      │    │
-  │  │                                             │    │
-  │  │  blocks（全量）:                            │    │
-  │  │  { block_id → Block(ref_count, hash, ...) } │    │
-  │  └─────────────────────────────────────────────┘    │
-  │                                                      │
-  │  allocate_slots(request, num_new_tokens):            │
-  │    1. compute_block_hashes(request.tokens)           │
-  │    2. For each hash: get_cached() or allocate_new()  │
-  │    3. 返回 slot_mapping                             │
-  └──────────────────────────────────────────────────────┘
+    KVM --> BP
+
+    subgraph BP["BlockPool"]
+        LRU["free_block_queue（LRU 双向链表）\n oldest ↔ B3 ↔ B7 ↔ B1 ↔ newest"]
+        CB["cached_blocks（哈希表）\nH0 → Block#7\nH1 → Block#23\n..."]
+        BL["blocks（全量）\nblock_id → Block(ref_count, hash, ...)"]
+    end
+
+    LRU <-->|"cache hit: 从队列移除"| CB
+    CB --- BL
 ```
 
 **关键源码**（`vllm/v1/core/kv_cache_utils.py`）：
@@ -149,24 +132,29 @@ Step 4: 调度器报告
 
 Block 的生命周期分为四个阶段：
 
-```
-                    ┌─────────────────────────────────────────┐
-                    │          Block 状态机                    │
-                    │                                         │
-  初始化 →  [FREE]  ──── get_new_blocks() ──→  [ACTIVE]       │
-              │                                    │          │
-              │ 位于 free_block_queue               │          │
-              │ ref_cnt = 0                        │          │
-              │                                    │ ref_cnt > 0
-              │ ← free_blocks() 归零时 ─────────── ┘          │
-              │                                              │
-              ├─ 空间充裕：留在队列等待复用（Prefix Cache）     │
-              │                                              │
-              └─ 空间不足：被 popleft() 驱逐 ─→  [EVICTED]    │
-                   ↑                              从 cached_blocks 删除 hash
-                   └─── 分配给新请求 ─────────── [ACTIVE]     │
-                                                              │
-                    └─────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> FREE : 初始化
+    FREE --> ACTIVE : get_new_blocks()\nref_cnt = 1
+
+    ACTIVE --> FREE : free_blocks()\nref_cnt → 0\n加入 free_block_queue 尾部
+
+    FREE --> FREE : 空间充裕\n留在队列等待复用（Prefix Cache）
+
+    FREE --> EVICTED : 空间不足\npopleft() 驱逐\n从 cached_blocks 删除 hash
+
+    EVICTED --> ACTIVE : 分配给新请求\nget_new_blocks()
+
+    note right of FREE
+        位于 free_block_queue
+        ref_cnt = 0
+        可作为 Prefix Cache 复用
+    end note
+
+    note right of ACTIVE
+        ref_cnt > 0
+        正在被请求使用
+    end note
 ```
 
 **完整时序示例**（block_size=16, 系统总共10个块）：
@@ -622,42 +610,29 @@ docker exec vllm python3 -m pytest /mnt/esfs/master_work/vllm-from-scratch/02_kv
 
 ### 7.2 全局 KV Cache 池的架构
 
-```
-Mooncake 全局 KV Cache 池架构：
+```mermaid
+flowchart TD
+    MS["全局 Metadata Server\netcd/Redis\nblock_hash → node_id, memory_addr, size, access_time\nAPI: publish() / query() / invalidate()"]
 
-┌─────────────────────────────────────────────────────────────────┐
-│                  全局 Metadata Server（etcd/Redis）              │
-│    block_hash → { node_id, memory_addr, size, access_time }     │
-│    提供：publish() / query() / invalidate() API                 │
-└────────────────────────────┬────────────────────────────────────┘
-                             │ 元数据查询（μs 级）
-              ┌──────────────▼──────────────┐
-              │         vLLM Workers         │
-              │                             │
-  ┌───────────┴──────┐        ┌─────────────┴────────┐
-  │   Prefill 节点   │        │    Decode 节点        │
-  │   (Node 0,1,...) │        │    (Node 4,5,...)     │
-  │                  │        │                       │
-  │  ① 计算 KV Cache │RDMA→  │  ② 接收 KV Cache     │
-  │  ② 发布到全局池  │        │  ③ 直接开始 Decode   │
-  │                  │        │                       │
-  │  GPU VRAM: 80GB  │        │  GPU VRAM: 80GB       │
-  │  CPU DRAM: 512GB │        │  CPU DRAM: 512GB      │
-  └──────────────────┘        └───────────────────────┘
-            │
-            ▼
-  ┌──────────────────┐
-  │  分布式存储节点  │
-  │  NVMe SSD: 2TB   │
-  │  （冷缓存层）    │
-  └──────────────────┘
+    MS -->|"元数据查询（μs 级）"| PW
+    MS -->|"元数据查询（μs 级）"| DW
 
-关键技术：
-  RDMA（Remote Direct Memory Access）：
-    - 跳过 CPU，直接 GPU→远端内存 传输
-    - InfiniBand / RoCEv2 网络
-    - 延迟：2-5μs（vs. TCP/IP: 50-100μs）
-    - 带宽：100-400 Gbps
+    subgraph PW["Prefill 节点（Node 0,1,...)"]
+        P1["① 计算 KV Cache\n② 发布到全局池\nGPU VRAM: 80GB\nCPU DRAM: 512GB"]
+    end
+
+    subgraph DW["Decode 节点（Node 4,5,...)"]
+        D1["② 接收 KV Cache\n③ 直接开始 Decode\nGPU VRAM: 80GB\nCPU DRAM: 512GB"]
+    end
+
+    PW -->|"RDMA WRITE\n100-400 Gbps\n延迟 2-5μs"| DW
+
+    PW --> STORE["分布式存储节点\nNVMe SSD: 2TB\n冷缓存层"]
+
+    style MS fill:#cce5ff,stroke:#004085
+    style PW fill:#d4edda,stroke:#155724
+    style DW fill:#fff3cd,stroke:#856404
+    style STORE fill:#f8d7da,stroke:#721c24
 ```
 
 ### 7.3 Mooncake 真实源码深度解析
@@ -690,75 +665,51 @@ Mooncake 全局 KV Cache 池架构：
 
 #### 7.3.2 核心数据流（逐步拆解源码）
 
-```
-完整 PD 传输时序（对应 mooncake_connector.py）：
+```mermaid
+sequenceDiagram
+    participant P as P-Node (Prefill)
+    participant D as D-Node (Decode)
+    participant BS as Bootstrap Server (HTTP)
+    participant ZMQ as ZMQ Side Channel
 
-┌─────────────────────────────────────────────────────────────────┐
-│                      Bootstrap 阶段（启动时）                    │
-│                                                                 │
-│  P-node 启动：                                                  │
-│    MooncakeConnectorWorker.__init__()                           │
-│      → self.engine = TransferEngine()                           │
-│      → self.engine.initialize(hostname, "P2PHANDSHAKE", "rdma") │
-│      → 启动 MooncakeBootstrapServer（HTTP 服务）                 │
-│      → 启动 ZMQ ROUTER socket（side channel，等待 D 的请求）     │
-│      → 调用 engine.batch_register_memory(kv_data_ptrs, ...)     │
-│        ← 预注册 GPU 内存到 RDMA NIC（一次性操作，之后 RDMA 直接访问）│
-│                                                                 │
-│  D-node 启动：                                                  │
-│    MooncakeConnectorWorker.__init__()                           │
-│      → self.engine = TransferEngine()                           │
-│      → self.engine.initialize(hostname, "P2PHANDSHAKE", "rdma") │
-│      → engine.batch_register_memory(kv_data_ptrs, ...)          │
-│      → 启动后台接收线程（receiver_loop）                         │
-└─────────────────────────────────────────────────────────────────┘
+    rect rgb(220, 240, 255)
+        Note over P,D: Bootstrap 阶段（启动时）
+        P->>P: TransferEngine.initialize(hostname, rdma)
+        P->>P: 启动 MooncakeBootstrapServer (HTTP)
+        P->>P: 启动 ZMQ ROUTER socket
+        P->>P: batch_register_memory(kv_data_ptrs)\n预注册 GPU 内存到 RDMA NIC
 
-┌─────────────────────────────────────────────────────────────────┐
-│                      请求处理阶段                                │
-│                                                                 │
-│  ① Scheduler 决策（P-node）                                     │
-│    scheduler: get_num_new_matched_tokens(request)               │
-│      → 检查 kv_transfer_params["do_remote_prefill"]             │
-│        （这个 flag 由路由层/LB 设置，表示本请求需要送到 D-node）   │
-│      → 返回 (count, True)：告诉调度器这批 token 将异步传给 D     │
-│    update_state_after_alloc()                                   │
-│      → 记录 request → local_block_ids 的映射                    │
-│                                                                 │
-│  ② P-node Prefill                                               │
-│    start_load_kv()：record_send_reqs() 更新 reqs_need_send      │
-│    → Prefill 正常执行，GPU 计算 KV Cache                         │
-│    request_finished()                                           │
-│      → send_meta.ready.set()  ← 通知等待中的 D-node，KV 已就绪  │
-│                                                                 │
-│  ③ D-node 发送请求（receiver_loop 异步执行）                     │
-│    start_load_kv(): _start_load_kv() →                         │
-│      连接 P-node bootstrap server，拿到 ZMQ side channel 地址   │
-│      receive_kv_from_single_worker(p_node_addr, pull_metas)    │
-│      → 通过 ZMQ 发送 MooncakeXferMetadata：                    │
-│          {                                                      │
-│            remote_hostname: D-node IP,                          │
-│            remote_port: D-node RDMA RPC port,                  │
-│            req_blocks: {req_id: (transfer_id, local_block_ids)},│
-│            kv_caches_base_addr: D-node GPU 内存基地址列表         │
-│          }                                                      │
-│                                                                 │
-│  ④ P-node 响应（sender_loop 异步执行）                           │
-│    _mooncake_sender_listener()接收 ZMQ 请求                     │
-│    等待 send_meta.ready（等 Prefill 完成）                       │
-│    _build_transfer_params()：                                   │
-│      计算 src_ptrs = kv_caches_base_addr + block_id * block_len │
-│      计算 dst_ptrs = D-node 发来的 kv_caches_base_addr + 偏移   │
-│      连续块合并：group_concurrent_contiguous() 减少 RDMA 描述符  │
-│    _send_blocks()：                                             │
-│      engine.batch_transfer_sync_write(remote_session,           │
-│                                       src_ptrs, dst_ptrs, lens) │
-│      ← RDMA WRITE 从 P-node GPU 直接写入 D-node GPU 内存        │
-│                                                                 │
-│  ⑤ D-node 等待完成                                              │
-│    process_pulling_result() → finished_recving_reqs.add(req_id) │
-│    get_finished() → 通知调度器 req_id 的 KV 已就绪              │
-│    调度器：req_id → RUNNING 状态，加入下一批次 Decode            │
-└─────────────────────────────────────────────────────────────────┘
+        D->>D: TransferEngine.initialize(hostname, rdma)
+        D->>D: batch_register_memory(kv_data_ptrs)
+        D->>D: 启动后台接收线程 receiver_loop
+    end
+
+    rect rgb(220, 255, 220)
+        Note over P,D: 请求处理阶段
+
+        Note over P: ① Scheduler 决策
+        P->>P: get_num_new_matched_tokens(request)\n检查 do_remote_prefill flag
+        P->>P: update_state_after_alloc()\n记录 request → local_block_ids
+
+        Note over D: ③ D-node 发送请求（异步）
+        D->>BS: 连接 P-node bootstrap server
+        BS-->>D: ZMQ side channel 地址
+        D->>ZMQ: MooncakeXferMetadata\nremote_hostname, remote_port\nreq_blocks, kv_caches_base_addr
+
+        Note over P: ② P-node Prefill
+        P->>P: Prefill 正常执行，GPU 计算 KV Cache
+        P->>P: request_finished()\nsend_meta.ready.set()
+
+        Note over P: ④ P-node 响应（sender_loop 异步）
+        ZMQ-->>P: 接收 ZMQ 请求
+        P->>P: 等待 send_meta.ready（等 Prefill 完成）
+        P->>P: _build_transfer_params()\n计算 src_ptrs / dst_ptrs\ngroup_concurrent_contiguous()
+        P->>D: RDMA WRITE\nbatch_transfer_sync_write(src_ptrs, dst_ptrs)\nP-node GPU → D-node GPU 内存
+
+        Note over D: ⑤ D-node 等待完成
+        D->>D: process_pulling_result()\nfinished_recving_reqs.add(req_id)
+        D->>D: get_finished() 通知调度器\nreq_id → RUNNING 状态，加入下一批次 Decode
+    end
 ```
 
 #### 7.3.3 关键源码注解
@@ -1170,36 +1121,33 @@ MISS            │ (更快)    │  (唯一选择) │
 
 #### 7.5.1 架构设计
 
-```
-我们的模拟实现（不依赖真实 RDMA）：
+```mermaid
+flowchart TD
+    subgraph SC["SimulatedCluster（模拟实现，不依赖真实 RDMA）"]
+        GMS["GlobalMetadataServer\n_blocks: dict[hash → KVBlockMeta(node_id, addr, ...)]\n_node_blocks: dict[node_id → list[hash]]（用于 LRU）\n方法：query_prefix() / publish() / unpublish()\n特性：线程安全（RLock），LRU 驱逐"]
 
-┌──────────────────────────────────────────────────────────┐
-│             GlobalMetadataServer                          │
-│  _blocks: dict[hash → KVBlockMeta(node_id, addr, ...)]   │
-│  _node_blocks: dict[node_id → list[hash]]（用于 LRU）    │
-│  方法：query_prefix() / publish() / unpublish()          │
-│  特性：线程安全（RLock），LRU 驱逐                       │
-└────────────────────────────────┬─────────────────────────┘
-                                  │
-              ┌───────────────────▼──────────────────────┐
-              │          TransferEngine                   │
-              │  后台工作线程池，模拟 RDMA 异步传输        │
-              │  延迟：同机架 200μs，跨机架 1ms           │
-              │  带宽：100 Gbps（根据 block 大小计算时延） │
-              │  方法：submit_transfer() / wait() /       │
-              │         is_complete() / callback()        │
-              └───────────────────┬──────────────────────┘
-                                  │
-              ┌───────────────────▼──────────────────────┐
-              │         MooncakeConnector                 │
-              │  （每个 vLLM Worker 实例持有一个）        │
-              │  get_num_new_matched_tokens()             │
-              │    → 查元数据 → 发起传输                  │
-              │  wait_for_kv()                            │
-              │    → 等传输完成（对应 WAITING_FOR_KV）    │
-              │  publish_kv()                             │
-              │    → 发布到全局池                         │
-              └──────────────────────────────────────────┘
+        TE["TransferEngine\n后台工作线程池，模拟 RDMA 异步传输\n延迟：同机架 200μs，跨机架 1ms\n带宽：100 Gbps（根据 block 大小计算时延）\n方法：submit_transfer() / wait() / is_complete() / callback()"]
+
+        subgraph Workers["vLLM Workers（每节点一个 MooncakeConnector）"]
+            MC1["MooncakeConnector (Node 0)\nget_num_new_matched_tokens()\n  → 查元数据 → 发起传输\nwait_for_kv()\n  → 等传输完成（WAITING_FOR_KV）\npublish_kv() → 发布到全局池"]
+            MC2["MooncakeConnector (Node 1)\n..."]
+            MC3["MooncakeConnector (Node N)\n..."]
+        end
+
+        GMS -->|"元数据查询"| TE
+        TE -->|"模拟 RDMA 传输"| MC1
+        TE -->|"模拟 RDMA 传输"| MC2
+        TE -->|"模拟 RDMA 传输"| MC3
+        MC1 -->|"publish/unpublish"| GMS
+        MC2 -->|"publish/unpublish"| GMS
+        MC3 -->|"publish/unpublish"| GMS
+    end
+
+    style GMS fill:#cce5ff,stroke:#004085
+    style TE fill:#d4edda,stroke:#155724
+    style MC1 fill:#fff3cd,stroke:#856404
+    style MC2 fill:#fff3cd,stroke:#856404
+    style MC3 fill:#fff3cd,stroke:#856404
 ```
 
 #### 7.5.2 关键实现解读
@@ -1294,28 +1242,35 @@ LLM 推理调度本质上是一个**在线装箱问题（Online Bin Packing）**
 
 #### 8.2.1 请求的三种队列
 
-```
-vLLM Scheduler 状态机：
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING : 新请求到达
 
-  新请求到达
-      │
-      ▼
-  [WAITING 队列]──────→ 等待足够的 KV Cache 块
-      │
-      │ schedule() 选中
-      ▼
-  [RUNNING 队列]──────→ 正在 Prefill 或 Decode
-      │           │
-      │           │ KV Cache 不足时
-      │           ▼
-      │     [抢占（Preemption）]
-      │       - 换出 KV Cache 到 CPU
-      │       - 或直接丢弃（重计算）
-      │       - 重新进入 WAITING
-      │
-      │ 生成 EOS 或达到 max_tokens
-      ▼
-  [FINISHED]───────────→ 释放 KV Cache 块
+    WAITING --> RUNNING : schedule() 选中\n分配 KV Cache 块
+
+    RUNNING --> FINISHED : 生成 EOS\n或达到 max_tokens
+
+    RUNNING --> PREEMPTED : KV Cache 不足\n(OOM)
+
+    PREEMPTED --> WAITING : 换出 KV Cache 到 CPU\n或直接丢弃（重计算）
+
+    FINISHED --> [*] : 释放 KV Cache 块
+
+    note right of WAITING
+        等待足够的 KV Cache 块
+        按 FCFS 顺序排队
+    end note
+
+    note right of RUNNING
+        正在 Prefill 或 Decode
+        占用 KV Cache 块
+    end note
+
+    note right of PREEMPTED
+        换出（Swap to CPU）
+        或重计算（Recompute）
+        vLLM V1 默认：重计算
+    end note
 ```
 
 #### 8.2.2 请求的阶段状态
@@ -1422,32 +1377,25 @@ vLLM V1 默认：重计算（简单，避免 PCIe 瓶颈）
 
 这是 vLLM 最核心的吞吐量优化之一：
 
-```
-静态批处理（Triton Inference Server 早期版本）：
-  ┌────────────────────────────────────────────────┐
-  │ 批次：[req_A, req_B, req_C]                    │
-  │ 等待最慢的请求 req_C 完成后，整批释放          │
-  │                                                │
-  │ req_A: ████░░░░░░░  (完成了，但在等)          │
-  │ req_B: ██████░░░░░  (完成了，但在等)          │
-  │ req_C: ███████████  (最慢，决定批次时长)       │
-  │                                                │
-  │ GPU 利用率：低（大量空闲等待）                 │
-  └────────────────────────────────────────────────┘
+```mermaid
+gantt
+    title 静态批处理 vs Continuous Batching 对比
+    dateFormat X
+    axisFormat Step %s
 
-Continuous Batching（vLLM）：
-  ┌────────────────────────────────────────────────┐
-  │ req_A 完成后，立即插入 req_D：                 │
-  │                                                │
-  │ Step1: [A][B][C]                               │
-  │ Step2: [A][B][C]                               │
-  │ Step3: [--][B][C] + [D]  ← A完成，D立即插入  │
-  │ Step4: [D][B][C]                               │
-  │ Step5: [D][--][C] + [E] ← B完成，E立即插入   │
-  │ ...                                            │
-  │                                                │
-  │ GPU 利用率：高（始终保持满载）                 │
-  └────────────────────────────────────────────────┘
+    section 静态批处理（等待最慢请求）
+    req_A 计算中     :done,    s1, 0, 4
+    req_A 空闲等待   :crit,    s2, 4, 11
+    req_B 计算中     :done,    s3, 0, 6
+    req_B 空闲等待   :crit,    s4, 6, 11
+    req_C 计算中     :active,  s5, 0, 11
+
+    section Continuous Batching（vLLM）
+    req_A Step1-3   :done,    c1, 0, 3
+    req_D Step4-8   :done,    c2, 3, 8
+    req_B Step1-5   :done,    c3, 0, 5
+    req_E Step6-9   :done,    c4, 5, 9
+    req_C Step1-9   :active,  c5, 0, 9
 ```
 
 ---

@@ -62,20 +62,18 @@ MoE FFN 层：
 
 解决方案：**显式分离共享知识与专门知识**：
 
-```
-DeepSeek MoE 架构（每层）：
+```mermaid
+flowchart TD
+    x[输入 x] --> SE[Shared Expert 共享专家\n每个 token 必然经过]
+    x --> R[Router 路由器]
+    R --> EP[Routed Expert Pool\nTop-K 竞争\n存储专业知识]
+    SE --> ADD((加法合并))
+    EP --> ADD
+    ADD --> y[输出 y]
 
-                        ┌─────────────────────────┐
-          x ─────────── │     Shared Expert(s)     │ ──────┐
-          │             └─────────────────────────┘       │
-          │                                               │ 加法合并
-          │             ┌─────────────────────────┐       │
-          └──→ Router ──│  Routed Expert Pool     │ ──────┘
-                        │  (Top-K 竞争)           │
-                        └─────────────────────────┘
-
-共享专家：每个 token 必然经过（存储通用知识）
-路由专家：每个 token 选 K 个（存储专业知识）
+    style SE fill:#d4e8ff,stroke:#4a90d9
+    style EP fill:#ffe8d4,stroke:#d98a4a
+    style ADD fill:#e8ffd4,stroke:#6abf4a
 ```
 
 **DeepSeek V2 / V3 配置对比**：
@@ -140,35 +138,33 @@ Step 5: 从这 2 个组的候选专家中，取最终 top_k=8 个专家
 
 #### 11.3.1 整体架构图
 
-```
-vLLM MoE 执行栈（DeepSeek V2/V3）：
+```mermaid
+flowchart TD
+    subgraph Python["DeepseekV2MoE Python 层"]
+        SE2[shared_experts\nDeepseekV2MLP\n普通 MLP]
+        subgraph SFM["SharedFusedMoE"]
+            RL[ReplicatedLinear\ngate/router]
+            FM[FusedMoE Triton\n路由专家计算]
+            RL --> FM
+        end
+    end
 
-┌──────────────────────────────────────────────────────────────┐
-│                   DeepseekV2MoE（Python 层）                  │
-│                                                              │
-│  ┌──────────────────┐    ┌─────────────────────────────────┐ │
-│  │  shared_experts  │    │      SharedFusedMoE             │ │
-│  │  DeepseekV2MLP   │    │  ┌─────────────────────────┐   │ │
-│  │  (普通 MLP)       │    │  │    ReplicatedLinear      │   │ │
-│  └──────────────────┘    │  │    (gate/router)         │   │ │
-│                          │  └─────────────────────────┘   │ │
-│                          │  ┌─────────────────────────┐   │ │
-│                          │  │    FusedMoE (Triton)     │   │ │
-│                          │  │    (路由专家计算)          │   │ │
-│                          │  └─────────────────────────┘   │ │
-│                          └─────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────┘
+    subgraph EP["Expert Parallel 通信层（多节点时）"]
+        direction LR
+        G0["GPU0\nExpert[0..63]"]
+        G1["GPU1\nExpert[64..127]"]
+        G2["GPU2\nExpert[128..191]"]
+        G3["GPU3\nExpert[192..255]"]
+        G0 <-->|All2All 分发/汇聚\nNCCL| G1
+        G0 <-->|All2All 分发/汇聚\nNCCL| G2
+        G0 <-->|All2All 分发/汇聚\nNCCL| G3
+    end
 
-Expert Parallel 通信层（多节点时）：
-┌──────────────────────────────────────────────────────────────┐
-│  GPU0 (Expert[0..63])    GPU1 (Expert[64..127])             │
-│  GPU2 (Expert[128..191]) GPU3 (Expert[192..255])            │
-│                                                              │
-│  All2All 分发:                                               │
-│    每个 GPU 的 token → 按路由目标 → 发送到对应 Expert GPU       │
-│  All2All 汇聚:                                               │
-│    每个 Expert GPU 计算结果 → 发送回原始 GPU                   │
-└──────────────────────────────────────────────────────────────┘
+    Python --> EP
+
+    style Python fill:#f0f4ff,stroke:#6680cc
+    style SFM fill:#e0e8ff,stroke:#6680cc
+    style EP fill:#fff4e0,stroke:#cc9944
 ```
 
 #### 11.3.2 关键源码路径
@@ -295,39 +291,31 @@ t=4: 每个GPU在本地做加权合并
 
 #### 11.4.1 架构设计图
 
-```
-Mini MoE 组件关系：
+```mermaid
+flowchart TD
+    subgraph MoELayer["MoELayer"]
+        IN["input_x [T, D]"]
 
-  ┌─────────────────────────────────────────────────────┐
-  │                    MoELayer                          │
-  │                                                      │
-  │  input_x [T, D]                                      │
-  │     │                                                │
-  │     ├──────────────────────────┐                    │
-  │     │                          │                    │
-  │     ▼                          ▼                    │
-  │  ┌──────────────┐    ┌──────────────────────────┐   │
-  │  │ shared_expert│    │       router             │   │
-  │  │ Expert(MLP)  │    │ TopKRouter /             │   │
-  │  └──────────────┘    │ GroupedTopKRouter        │   │
-  │         │            └──────────────────────────┘   │
-  │         │                 │                          │
-  │  shared_out         topk_ids [T, K]                  │
-  │         │           topk_weights [T, K]              │
-  │         │                 │                          │
-  │         │            ┌────┴─────────────┐           │
-  │         │            │  Expert Dispatch  │           │
-  │         │            │  for e in E:     │           │
-  │         │            │    tokens → e    │           │
-  │         │            │    e(tokens) → o │           │
-  │         │            └────┬─────────────┘           │
-  │         │                 │                          │
-  │         │           routed_out [T, D]                │
-  │         │                 │                          │
-  │         └────────── + ────┘                         │
-  │                          │                          │
-  │                    output [T, D]                     │
-  └─────────────────────────────────────────────────────┘
+        IN --> SEXP["shared_expert\nExpert MLP"]
+        IN --> ROUTER["router\nTopKRouter /\nGroupedTopKRouter"]
+
+        SEXP --> SHOUT["shared_out"]
+
+        ROUTER --> TOPK["topk_ids [T, K]\ntopk_weights [T, K]"]
+
+        TOPK --> DISPATCH["Expert Dispatch\nfor e in E:\n  tokens → e\n  e(tokens) → o"]
+
+        DISPATCH --> ROUT["routed_out [T, D]"]
+
+        SHOUT --> MERGE((+))
+        ROUT --> MERGE
+
+        MERGE --> OUT["output [T, D]"]
+    end
+
+    style MoELayer fill:#f8f8ff,stroke:#8888cc
+    style DISPATCH fill:#fff0e0,stroke:#cc8844
+    style MERGE fill:#e8ffe8,stroke:#44aa44
 ```
 
 #### 11.4.2 核心实现要点
@@ -517,42 +505,56 @@ $$q = [q_{nope} | q_{rope}]$$
 
 #### 12.4.1 整体架构图
 
-```
-vLLM MLA 执行路径：
+```mermaid
+flowchart LR
+    subgraph Prefill["Prefill 阶段（处理 prompt 的所有 token）"]
+        direction TB
+        P_IN["hidden_states [T_prompt, D]"]
+        subgraph PQ["Q 计算"]
+            P_QA["q_a_proj"]
+            P_QN["q_a_layernorm"]
+            P_QB["q_b_proj"]
+            P_QA --> P_QN --> P_QB
+        end
+        subgraph PKV["KV 压缩"]
+            P_KVA["kv_a_proj_with_mqa"]
+            P_CKV["c_kv [T, kv_lora_rank]"]
+            P_KR["k_rope [T, rope_dim]"]
+            P_KVA --> P_CKV
+            P_KVA --> P_KR
+        end
+        P_IN --> PQ
+        P_IN --> PKV
+        P_CKV --> P_KVCACHE[("存入 KV Cache")]
+        P_KR --> P_KVCACHE
+        P_QB --> P_FA["FlashAttention\nkv_b_proj 展开 c_kv → K,V"]
+        P_CKV --> P_FA
+    end
 
-Prefill 阶段（处理 prompt 的所有 token）：
-  ┌──────────────────────────────────────────────────────────────┐
-  │  hidden_states [T_prompt, D]                                 │
-  │         │                                                    │
-  │    ┌────┴──────────┐    ┌──────────────────────────┐         │
-  │    │   Q 计算       │    │   KV 压缩                 │         │
-  │    │ q_a_proj      │    │ kv_a_proj_with_mqa        │         │
-  │    │ q_a_layernorm │    │  → c_kv [T, kv_lora_rank]│         │
-  │    │ q_b_proj      │    │  → k_rope [T, rope_dim]  │         │
-  │    └────┬──────────┘    └────────┬─────────────────┘         │
-  │         │                        │                           │
-  │     Q [T, H, qk_dim]         存入 KV Cache ←──────────────  │
-  │         │                        │                           │
-  │    ┌────┴────────────────────────┴──┐                        │
-  │    │      FlashAttention            │                        │
-  │    │  (kv_b_proj 展开 c_kv → K,V)  │                        │
-  │    └────────────────────────────────┘                        │
-  └──────────────────────────────────────────────────────────────┘
+    subgraph Decode["Decode 阶段（每次生成 1 个 token）"]
+        direction TB
+        D_IN["hidden_states [1, D]"]
+        D_Q["Q 计算（同 Prefill）"]
+        D_KVCACHE[("从 KV Cache 读取\n历史 c_kv, k_rope")]
+        D_KVB["kv_b_proj c_kv\n→ K_nope, V（实时展开）"]
+        D_ROPE["apply_rope k_rope\n→ K_rope"]
+        D_KFULL["K = K_nope 拼接 K_rope"]
+        D_ATTN["PagedAttention\n使用 block_table 读取历史块"]
 
-Decode 阶段（每次生成 1 个 token）：
-  ┌──────────────────────────────────────────────────────────────┐
-  │  hidden_states [1, D]                                        │
-  │         │                                                    │
-  │    Q 计算（同 Prefill）                                       │
-  │         │                                                    │
-  │    从 KV Cache 读取历史 c_kv, k_rope                          │
-  │         │                                                    │
-  │    kv_b_proj(c_kv) → K_nope, V    （实时展开）               │
-  │    apply_rope(k_rope) → K_rope                               │
-  │    K = [K_nope | K_rope]                                     │
-  │         │                                                    │
-  │    PagedAttention（使用 block table 读取历史块）               │
-  └──────────────────────────────────────────────────────────────┘
+        D_IN --> D_Q
+        D_IN --> D_KVCACHE
+        D_KVCACHE --> D_KVB
+        D_KVCACHE --> D_ROPE
+        D_KVB --> D_KFULL
+        D_ROPE --> D_KFULL
+        D_Q --> D_ATTN
+        D_KFULL --> D_ATTN
+    end
+
+    style Prefill fill:#f0f8ff,stroke:#4a80cc
+    style Decode fill:#fff8f0,stroke:#cc8040
+    style P_KVCACHE fill:#ffffd4,stroke:#aaaa44
+    style D_KVCACHE fill:#ffffd4,stroke:#aaaa44
 ```
 
 #### 12.4.2 关键源码解析
@@ -643,52 +645,54 @@ qk_rope_head_dim           -             64
 
 #### 12.5.1 架构设计图
 
-```
-Mini MLA 数据流（Prefill）：
+```mermaid
+flowchart TD
+    HS["hidden_states [B, T, D]"]
 
-hidden_states [B, T, D]
-        │
-        ├──────────────────────────────────────────────┐
-        │                                              │
-        ▼                                              ▼
-  ┌──────────────────┐                    ┌──────────────────────┐
-  │    Q 计算         │                    │    KV 低秩压缩        │
-  │ q_a_proj [B,T,L] │                    │ kv_a_proj_with_mqa   │
-  │ q_a_layernorm    │                    │ [B, T, lora+rope]    │
-  │ q_b_proj         │                    └──────────┬───────────┘
-  │ [B,T,H,nope+rope]│                               │
-  └──────────────────┘                    ┌──────────┴───────────┐
-        │                                 │                      │
-        ├──── q_nope [B,T,H,nope]        c_kv                k_rope
-        └──── q_rope [B,T,H,rope]    [B,T,lora]           [B,T,rope]
-                 │                        │                      │
-                 │           ┌────────────┘                      │
-                 │           ▼                                    │
-                 │    kv_b_proj(c_kv)                           RoPE
-                 │    → k_nope [B,S,H,nope]                      │
-                 │    → v     [B,S,H,v_dim]      k_rope_out [B,S,H,rope]
-                 │           │                        │
-        RoPE     │           └──────────────┐         │
-           │     │                          │         │
-        q_rope_out                   k_full = [k_nope | k_rope_out]
-                 │                          │
-                 └─────────────────────────▶│
-                                           │
-                            q_full = [q_nope | q_rope_out]
-                                           │
-                                    ┌──────┴──────┐
-                                    │  Attention   │
-                                    │  Q @ K^T     │
-                                    │  softmax     │
-                                    │  @ V         │
-                                    └──────┬──────┘
-                                           │
-                                    o_proj → output [B, T, D]
+    HS --> QA["q_a_proj [B,T,L]"]
+    HS --> KVA["kv_a_proj_with_mqa\n[B, T, lora+rope]"]
 
-KV Cache 存储（只存这两个）：
-  ┌─────────────┐  ┌───────────┐
-  │ c_kv [B,T,L]│  │k_rope[B,T,r]│
-  └─────────────┘  └───────────┘
+    QA --> QN["q_a_layernorm"]
+    QN --> QB["q_b_proj\n[B,T,H,nope+rope]"]
+
+    QB --> QNOPE["q_nope [B,T,H,nope]"]
+    QB --> QROPE["q_rope [B,T,H,rope]"]
+
+    KVA --> CKV["c_kv [B,T,lora]"]
+    KVA --> KROPE["k_rope [B,T,rope]"]
+
+    CKV --> KVB["kv_b_proj c_kv"]
+    KVB --> KNOPE["k_nope [B,S,H,nope]"]
+    KVB --> V["v [B,S,H,v_dim]"]
+
+    KROPE --> ROPE_K["RoPE"]
+    ROPE_K --> KROPEOUT["k_rope_out [B,S,H,rope]"]
+
+    QROPE --> ROPE_Q["RoPE"]
+    ROPE_Q --> QROPEOUT["q_rope_out"]
+
+    KNOPE --> KFULL["k_full = k_nope 拼接 k_rope_out"]
+    KROPEOUT --> KFULL
+
+    QNOPE --> QFULL["q_full = q_nope 拼接 q_rope_out"]
+    QROPEOUT --> QFULL
+
+    QFULL --> ATTN["Attention\nQ @ K^T → softmax → @ V"]
+    KFULL --> ATTN
+    V --> ATTN
+
+    ATTN --> OPROJ["o_proj → output [B, T, D]"]
+
+    subgraph KVCache["KV Cache 存储（只存这两个）"]
+        CKV2["c_kv [B,T,L]"]
+        KROPE2["k_rope [B,T,r]"]
+    end
+
+    CKV -.->|存储| CKV2
+    KROPE -.->|存储| KROPE2
+
+    style KVCache fill:#ffffd4,stroke:#aaaa44
+    style ATTN fill:#e8ffe8,stroke:#44aa44
 ```
 
 #### 12.5.2 关键实现细节
@@ -807,31 +811,34 @@ Decode 的特点：
 
 ### 13.2 PD 分离的系统架构
 
-```
-PD 分离集群架构：
+```mermaid
+flowchart TD
+    subgraph Cluster["生产 LLM 服务集群"]
+        subgraph PCluster["Prefill 节点集群\n高算力 GPU\n专注 Prefill\nBatch 大型请求"]
+            P0[P-Node 0]
+            P1[P-Node 1]
+            P2[P-Node 2]
+        end
 
-┌──────────────────────────────────────────────────────────────────┐
-│                       生产 LLM 服务集群                            │
-│                                                                  │
-│  ┌───────────────────┐           ┌─────────────────────────────┐ │
-│  │   Prefill 节点集群 │           │    Decode 节点集群            │ │
-│  │                   │           │                             │ │
-│  │  [P-Node 0]       │  KV Cache │  [D-Node 0] ← KV ←         │ │
-│  │  [P-Node 1]       │ ─────────→│  [D-Node 1] ← KV ←         │ │
-│  │  [P-Node 2]       │  (RDMA)   │  [D-Node 2] ← KV ←         │ │
-│  │                   │           │                             │ │
-│  │  特点：           │           │  特点：                      │ │
-│  │  - 高算力 GPU     │           │  - 高内存带宽 GPU             │ │
-│  │  - 专注 Prefill   │           │  - 持续流式输出               │ │
-│  │  - Batch 大型请求 │           │  - 服务 M 个并发对话          │ │
-│  └───────────────────┘           └─────────────────────────────┘ │
-│                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │   全局元数据服务器（类 Mooncake Store）                     │   │
-│  │   - 记录哪个 Prefill 节点有哪些 block                       │   │
-│  │   - 路由请求到合适的节点                                    │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────┘
+        subgraph DCluster["Decode 节点集群\n高内存带宽 GPU\n持续流式输出\n服务 M 个并发对话"]
+            D0[D-Node 0]
+            D1[D-Node 1]
+            D2[D-Node 2]
+        end
+
+        META["全局元数据服务器\n类 Mooncake Store\n记录哪个 Prefill 节点有哪些 block\n路由请求到合适节点"]
+
+        P0 -->|KV Cache RDMA| D0
+        P1 -->|KV Cache RDMA| D1
+        P2 -->|KV Cache RDMA| D2
+
+        P0 & P1 & P2 --> META
+        META --> D0 & D1 & D2
+    end
+
+    style PCluster fill:#e8f4ff,stroke:#4a80cc
+    style DCluster fill:#fff0e8,stroke:#cc6a4a
+    style META fill:#f0ffe8,stroke:#4acc6a
 ```
 
 ### 13.3 KV Cache 跨节点传输
@@ -851,17 +858,21 @@ PD 分离集群架构：
     接收端：直接从发送端 GPU 内存读取（无 CPU 介入）
     延迟：0.5-2μs，带宽 200-800Gbps (InfiniBand HDR/NDR)
     CPU 零介入
+```
 
 RDMA One-sided READ 流程：
 
-  D-Node (读取方)                      P-Node (数据源)
-       │                                    │
-       │── 1. 注册本地接收 buffer ──────────│
-       │── 2. 发送 RDMA READ 请求 ─────────→│
-       │                              （无需 CPU 干预）
-       │←─ 3. DMA 直接传输 KV blocks ───────│
-       │── 4. 本地 buffer 已填充 ────────── │
-       │── 5. 通知调度器，开始 Decode ───── │
+```mermaid
+sequenceDiagram
+    participant D as D-Node 读取方
+    participant P as P-Node 数据源
+
+    D->>D: 1. 注册本地接收 buffer
+    D->>P: 2. 发送 RDMA READ 请求
+    Note over P: 无需 CPU 干预
+    P-->>D: 3. DMA 直接传输 KV blocks
+    D->>D: 4. 本地 buffer 已填充
+    D->>D: 5. 通知调度器，开始 Decode
 ```
 
 #### 13.3.2 vLLM 的 KVConnector 接口
@@ -1037,34 +1048,34 @@ class MooncakeConnector(KVConnectorBase_V1):
 
 #### 13.4.1 架构设计图
 
-```
-全局 KV Cache 池（06_global_prefix_cache/global_kv_pool.py）：
+```mermaid
+flowchart TD
+    subgraph SimCluster["SimulatedCluster\n06_global_prefix_cache/global_kv_pool.py"]
+        subgraph PNodes["Prefill Nodes"]
+            PC["MooncakeConnector\npublish_kv"]
+        end
 
-┌─────────────────────────────────────────────────────────────┐
-│                   SimulatedCluster                           │
-│                                                             │
-│  ┌────────────────┐          ┌─────────────────────────┐   │
-│  │  Prefill Nodes │          │     Decode Nodes         │   │
-│  │  ┌──────────┐  │          │  ┌──────────────────┐   │   │
-│  │  │MooncakeCon│ │          │  │  MooncakeConnector│   │   │
-│  │  │nector    │ │          │  │  get_matched_tokens│   │   │
-│  │  │publish_kv│ │          │  │  wait_for_kv      │   │   │
-│  │  └──────────┘  │          │  └──────────────────┘   │   │
-│  └────────────────┘          └─────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │            GlobalMetadataServer                      │   │
-│  │   block_hash → {node_id, token_ids}                 │   │
-│  │   LRU 淘汰 + 命中率统计 + 并发安全（RLock）           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │            TransferEngine                            │   │
-│  │   异步 worker thread 模拟 RDMA 传输                   │   │
-│  │   submit_transfer() → transfer_id                   │   │
-│  │   wait(tid, timeout) → TransferResult               │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+        subgraph DNodes["Decode Nodes"]
+            DC["MooncakeConnector\nget_matched_tokens\nwait_for_kv"]
+        end
+
+        META["GlobalMetadataServer\nblock_hash → node_id, token_ids\nLRU 淘汰 + 命中率统计 + 并发安全 RLock"]
+
+        TE["TransferEngine\n异步 worker thread 模拟 RDMA 传输\nsubmit_transfer → transfer_id\nwait tid, timeout → TransferResult"]
+
+        PC -->|publish block_hash| META
+        DC -->|query_prefix| META
+        META -->|返回 node_id| DC
+        DC -->|submit_transfer| TE
+        PC -->|src_node| TE
+        TE -->|异步传输 KV blocks| DC
+    end
+
+    style SimCluster fill:#f8f8ff,stroke:#8888cc
+    style PNodes fill:#e8f4ff,stroke:#4a80cc
+    style DNodes fill:#fff0e8,stroke:#cc6a4a
+    style META fill:#f0ffe8,stroke:#4acc6a
+    style TE fill:#fff8e8,stroke:#ccaa44
 ```
 
 #### 13.4.2 实现层次
@@ -1194,42 +1205,47 @@ docker exec vllm python3 -m pytest /mnt/esfs/master_work/vllm-from-scratch/06_gl
 
 vLLM 在 V1 版本进行了一次根本性重构，解决 V0 的架构局限：
 
-```
-V0 架构（旧）：
+```mermaid
+flowchart LR
+    subgraph V0["V0 架构（旧）：单进程，同步"]
+        direction TB
+        V0_REQ["用户请求"]
+        V0_AE["AsyncLLMEngine\nblocking"]
+        V0_LE["LLMEngine"]
+        V0_EC["EngineCore"]
+        V0_SC["Scheduler Python"]
+        V0_ME["ModelExecutor"]
+        V0_W["Worker GPU"]
+        V0_ATT["Attention / MoE / ..."]
 
-  [用户请求] → AsyncLLMEngine
-                    │ (blocking)
-               LLMEngine
-                    │
-               EngineCore ─── Scheduler (Python)
-                    │
-               ModelExecutor ─── Worker[GPU]
-                    │                  │
-               (单进程，同步)      Attention/MoE/...
+        V0_REQ --> V0_AE --> V0_LE --> V0_EC
+        V0_EC --- V0_SC
+        V0_EC --> V0_ME --- V0_W --> V0_ATT
+    end
 
-V0 问题：
-  - Engine 和 Model 在同一进程，GIL 竞争
-  - Scheduler 每步都在 Python 层做大量工作
-  - 难以支持 CUDA Graph（形状变化）
-  - 投机解码、PD 分离等功能难以插入
-```
+    subgraph V1["V1 架构（新）：多进程，异步"]
+        direction TB
+        V1_REQ["用户请求"]
+        V1_AE["AsyncLLMEngine\n非阻塞前端，独立进程"]
+        V1_EC["EngineCore 进程"]
+        V1_SC["Scheduler\n完全重写"]
+        V1_KV["KVCacheManager\n显式管理"]
+        V1_ME["ModelExecutorV1"]
+        V1_W["GPU Worker 进程群"]
+        V1_IB["InputBatch\nCUDA Graph Capture\nSampler\nRejectionSampler spec decode"]
+        V1_AB["Attention Backends\nMLA / MHA / Flash\nMoE / FusedMoE"]
 
-```
-V1 架构（新）：
+        V1_REQ --> V1_AE
+        V1_AE -->|ZeroMQ IPC| V1_EC
+        V1_EC --- V1_SC
+        V1_SC --- V1_KV
+        V1_EC --> V1_ME --> V1_W
+        V1_W --- V1_IB
+        V1_W --- V1_AB
+    end
 
-  [用户请求] → AsyncLLMEngine （非阻塞前端，独立进程）
-                    │ ZeroMQ (IPC)
-               EngineCore 进程 ─── Scheduler（完全重写）
-                    │                   │
-                    │              KVCacheManager（显式管理）
-                    │
-               ModelExecutorV1 → GPU Worker 进程群
-                    │                  │
-               InputBatch              │
-               CUDA Graph Capture    Attention Backends
-               Sampler                │
-               RejectionSampler      MLA / MHA / Flash
-               (spec decode)         MoE / FusedMoE
+    style V0 fill:#fff0f0,stroke:#cc4444
+    style V1 fill:#f0fff0,stroke:#44aa44
 ```
 
 **V1 主要改进**：
@@ -1245,46 +1261,33 @@ V1 架构（新）：
 
 ### 14.2 V1 完整请求生命周期
 
-```
-完整数据流（从请求到 token 输出）：
+```mermaid
+flowchart TD
+    USER["用户侧\nengine.generate('Hello, world', sampling_params)"]
 
-用户侧：
-  engine.generate("Hello, world", sampling_params)
-       │
-       ▼
-AsyncLLMEngine（前端进程）
-  - 管理并发请求
-  - 流式返回 token
-  - 处理超时/取消
-       │ ZeroMQ PUSH
-       ▼
-EngineCore（独立进程）
-       │
-  ┌────┴────────────────────────────────────────┐
-  │              推理主循环（每步）               │
-  │                                             │
-  │  1. Scheduler.schedule()                    │
-  │     - 选择本步要处理的请求                   │
-  │     - 分配/释放 KV Cache blocks              │
-  │     - 决定 chunked prefill 的 chunk 大小     │
-  │     - 投机解码：决定 draft token 数           │
-  │     → SchedulerOutput                       │
-  │              │                              │
-  │  2. ModelExecutor.execute_model()           │
-  │     - 构建 InputBatch（token_ids, pos, ...)  │
-  │     - 推理（可能 CUDA Graph 加速）           │
-  │     - Sampling（greedy/top-p/top-k）         │
-  │     - 如果投机解码：RejectionSampling        │
-  │     → ModelRunnerOutput                     │
-  │              │                              │
-  │  3. Scheduler.update_from_output()          │
-  │     - 更新 num_computed_tokens               │
-  │     - 完成的请求：释放 KV blocks             │
-  │     - 更新 prefix cache hash 表              │
-  │     - 投机解码：统计接受率                   │
-  │              │                              │
-  │  4. AsyncLLMEngine 读取输出，流式返回         │
-  └─────────────────────────────────────────────┘
+    USER --> AE["AsyncLLMEngine 前端进程\n管理并发请求\n流式返回 token\n处理超时/取消"]
+
+    AE -->|ZeroMQ PUSH| EC["EngineCore 独立进程"]
+
+    subgraph Loop["推理主循环（每步）"]
+        SC["1. Scheduler.schedule()\n选择本步要处理的请求\n分配/释放 KV Cache blocks\n决定 chunked prefill 的 chunk 大小\n投机解码：决定 draft token 数\n→ SchedulerOutput"]
+
+        ME["2. ModelExecutor.execute_model()\n构建 InputBatch token_ids, pos, ...\n推理（可能 CUDA Graph 加速）\nSampling greedy/top-p/top-k\n如果投机解码：RejectionSampling\n→ ModelRunnerOutput"]
+
+        UPD["3. Scheduler.update_from_output()\n更新 num_computed_tokens\n完成的请求：释放 KV blocks\n更新 prefix cache hash 表\n投机解码：统计接受率"]
+
+        STREAM["4. AsyncLLMEngine 读取输出，流式返回"]
+
+        SC --> ME --> UPD --> STREAM --> SC
+    end
+
+    EC --> Loop
+
+    style Loop fill:#f8f8ff,stroke:#8888cc
+    style SC fill:#e8f4ff,stroke:#4a80cc
+    style ME fill:#f4e8ff,stroke:#8040cc
+    style UPD fill:#e8ffe8,stroke:#44aa44
+    style STREAM fill:#ffe8e8,stroke:#cc4444
 ```
 
 ### 14.3 关键子系统详解
@@ -1419,113 +1422,104 @@ CUDA Graph 的作用：
 
 经过前14章的深入分析，我们的 **Mini vLLM**（`05_mini_vllm/mini_vllm.py`）将所有核心组件串联起来：
 
-```
-Mini vLLM 完整架构图：
+```mermaid
+flowchart TD
+    subgraph Engine["MiniVLLM 引擎"]
+        GEN["generate(prompts)"]
 
-  ┌────────────────────────────────────────────────────────────────┐
-  │                        MiniVLLM 引擎                            │
-  │                                                                │
-  │  generate(prompts)                                             │
-  │       │                                                        │
-  │       ▼                                                        │
-  │  ┌──────────────────────────────────────────────────────────┐  │
-  │  │                   推理主循环                               │  │
-  │  │                                                          │  │
-  │  │  ┌─────────────────────────┐                             │  │
-  │  │  │       Scheduler         │                             │  │
-  │  │  │  - waiting / running 队列│                             │  │
-  │  │  │  - BlockAllocator        │                             │  │
-  │  │  │    (LRU + Prefix Cache)  │                             │  │
-  │  │  │  - Chunked Prefill 支持  │                             │  │
-  │  │  └─────────────┬───────────┘                             │  │
-  │  │                │ SchedulerOutput                          │  │
-  │  │                ▼                                          │  │
-  │  │  ┌─────────────────────────┐                             │  │
-  │  │  │    MiniTransformer       │                             │  │
-  │  │  │  ┌───────────────────┐  │                             │  │
-  │  │  │  │  Embedding Layer  │  │                             │  │
-  │  │  │  └────────┬──────────┘  │                             │  │
-  │  │  │           │             │                             │  │
-  │  │  │  for layer in layers:   │                             │  │
-  │  │  │  ┌────────▼──────────┐  │                             │  │
-  │  │  │  │  Attention         │  │  ← 读写 KV Cache           │  │
-  │  │  │  │  (MHA 简化版)      │  │    按 block_table 寻址      │  │
-  │  │  │  └────────┬──────────┘  │                             │  │
-  │  │  │  ┌────────▼──────────┐  │                             │  │
-  │  │  │  │  FFN / MoE       │  │                             │  │
-  │  │  │  └────────┬──────────┘  │                             │  │
-  │  │  │           │             │                             │  │
-  │  │  │  ┌────────▼──────────┐  │                             │  │
-  │  │  │  │  LM Head (logits) │  │                             │  │
-  │  │  │  └───────────────────┘  │                             │  │
-  │  │  └─────────────┬───────────┘                             │  │
-  │  │                │ logits                                   │  │
-  │  │                ▼                                          │  │
-  │  │  ┌─────────────────────────┐                             │  │
-  │  │  │       Sampler            │                             │  │
-  │  │  │  - Greedy / Temperature  │                             │  │
-  │  │  │  - Top-P / Top-K         │                             │  │
-  │  │  └─────────────┬───────────┘                             │  │
-  │  │                │ next_tokens                              │  │
-  │  │                ▼                                          │  │
-  │  │         更新请求状态 → 循环                                │  │
-  │  └──────────────────────────────────────────────────────────┘  │
-  └────────────────────────────────────────────────────────────────┘
+        subgraph Loop["推理主循环"]
+            subgraph SC["Scheduler"]
+                SCQ["waiting / running 队列"]
+                SCA["BlockAllocator\nLRU + Prefix Cache"]
+                SCC["Chunked Prefill 支持"]
+            end
 
-外部 KV Cache（GPU 内存）：
-  kv_caches: List[(k_cache, v_cache)]  每层一个
-  k_cache: [num_blocks, block_size, num_heads, head_dim]
-  v_cache: [num_blocks, block_size, num_heads, head_dim]
+            subgraph MT["MiniTransformer"]
+                EMB["Embedding Layer"]
+                subgraph Layers["for layer in layers"]
+                    ATT["Attention MHA 简化版\n读写 KV Cache\n按 block_table 寻址"]
+                    FFN["FFN / MoE"]
+                    ATT --> FFN
+                end
+                LMH["LM Head logits"]
+                EMB --> ATT
+                FFN --> LMH
+            end
+
+            SAMP["Sampler\nGreedy / Temperature\nTop-P / Top-K"]
+            UPD["更新请求状态 → 循环"]
+
+            SC -->|SchedulerOutput| MT
+            MT -->|logits| SAMP
+            SAMP -->|next_tokens| UPD
+            UPD --> SC
+        end
+
+        GEN --> Loop
+    end
+
+    KVC[("外部 KV Cache GPU 内存\nkv_caches: List[(k_cache, v_cache)] 每层一个\nk_cache: [num_blocks, block_size, num_heads, head_dim]\nv_cache: [num_blocks, block_size, num_heads, head_dim]")]
+
+    ATT <-->|读写| KVC
+
+    style Engine fill:#f8f8ff,stroke:#8888cc
+    style Loop fill:#f0f4ff,stroke:#7070cc
+    style SC fill:#e8f4ff,stroke:#4a80cc
+    style MT fill:#f4e8ff,stroke:#8040cc
+    style Layers fill:#ede0ff,stroke:#7040cc
+    style KVC fill:#ffffd4,stroke:#aaaa44
 ```
 
 ### 15.2 各组件协作数据流
 
 #### 15.2.1 Prefill 步
 
-```
-时序（Prefill：处理 prompt）：
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant SC as Scheduler
+    participant MT as MiniTransformer
+    participant KV as KV Cache
+    participant SP as Sampler
 
-  用户: "Tell me about..."（100 tokens）
+    User->>SC: "Tell me about..." 100 tokens
+    Note over SC: 1. 检查 Prefix Cache：哈希前几个 block
+    Note over SC: 2. 发现 block_0 命中（节省重算）
+    Note over SC: 3. 分配 block_1..block_6
+    Note over SC: 4. block_table = [0, 23, 45, 67, 89, 100, 112]
+    Note over SC: 5. num_tokens_to_compute = 84
 
-  Scheduler:
-    1. 检查 Prefix Cache：哈希前几个 block
-    2. 发现 block_0 命中（节省重算）
-    3. 分配 block_1..block_6（新块，100 tokens / 16 = 7块）
-    4. 生成 block_table = [0 (复用), 23, 45, 67, 89, 100, 112]
-    5. num_tokens_to_compute = 100 - 16 = 84（跳过已缓存的）
-
-  compute_slot_mapping:
-    [16, 17, 18, ..., 99] → 实际物理 slot 地址
-
-  MiniTransformer.forward(input_ids[16:100], positions[16:100]):
-    - 每层 attention：
-        Q: 当前 token 的 Q
-        K, V: 写入 kv_cache 对应物理 slot
-        Attention: Q @ K^T（含历史 block）
-
-  Sampler: 取 logits[-1]（最后一个 token 的 logit）→ next_token
+    SC->>MT: forward(input_ids[16:100], positions[16:100])
+    loop 每层 attention
+        MT->>KV: 写入 K,V 到对应物理 slot
+        MT->>KV: 读取历史 blocks 做 Q @ K^T
+    end
+    MT->>SP: logits
+    SP->>SC: next_token（logits[-1]）
 ```
 
 #### 15.2.2 Decode 步
 
-```
-时序（Decode：逐 token 生成）：
+```mermaid
+sequenceDiagram
+    participant SC as Scheduler
+    participant MT as MiniTransformer
+    participant KV as KV Cache
+    participant SP as Sampler
 
-  Scheduler:
-    1. req 已在 running，只需处理 1 个 token
-    2. 分配下一个 slot（如果当前 block 满，分配新块）
-    3. num_tokens_to_compute = 1
+    Note over SC: req 已在 running，只需处理 1 个 token
+    Note over SC: 分配下一个 slot（如果当前 block 满，分配新块）
+    Note over SC: num_tokens_to_compute = 1
 
-  MiniTransformer.forward(input_ids=[next_token], positions=[seq_len]):
-    - 每层 attention：
-        Q: 当前 token 的 Q（1个）
-        从 kv_cache 读取所有历史 K, V
-        Attention: 标准 decode attention
-        将当前 K, V 写入下一个空 slot
-
-  Sampler: logits[0] → next_token
-
-  循环，直到生成 EOS 或达到 max_new_tokens
+    SC->>MT: forward(input_ids=[next_token], positions=[seq_len])
+    loop 每层 attention
+        MT->>KV: 读取所有历史 K, V
+        Note over MT: 标准 decode attention
+        MT->>KV: 将当前 K, V 写入下一个空 slot
+    end
+    MT->>SP: logits[0]
+    SP->>SC: next_token
+    Note over SC: 循环，直到生成 EOS 或达到 max_new_tokens
 ```
 
 #### 15.2.3 BlockAllocator 与 Prefix Cache
