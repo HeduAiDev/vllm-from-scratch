@@ -639,6 +639,134 @@ qk_rope_head_dim           -             64
   MLA：  8192 × 60 ×   576 × 2B =  0.6 GB
 ```
 
+#### 12.4.4 vllm-ascend AscendMLAImpl——Ascend 专属优化
+
+> 源码：`vllm_ascend/attention/mla_v1.py`
+
+vllm-ascend 在上游 vLLM 的 `MLAAttentionImpl` 基础上进行了深度定制，主类为 `AscendMLAImpl`（继承 `MLAAttentionImpl`）。
+
+**双 KV Cache 结构（最关键差异）**：
+
+上游 vLLM 将 c_kv（kv_lora_rank）和 k_rope 存在同一个张量。vllm-ascend 将其**分开存储**：
+
+```python
+# mla_v1.py:1095-1120 — exec_kv_decode
+# kv_caches 是一个 tuple，index 0 是 k_nope，index 1 是 k_pe
+k_nope = kv_caches[0]   # [num_blocks, num_kv_heads, block_size, kv_lora_rank]
+k_pe   = kv_caches[1]   # [num_blocks, num_kv_heads, block_size, qk_rope_head_dim]
+```
+
+分开存的好处：每个 cache 的维度和访问模式不同，可以独立优化内存布局（NZ format / 普通 format 各选最优）。
+
+**预转置 W_UK_T 加速 Decode**（`mla_v1.py:823-835`）：
+
+```python
+# _q_proj_and_k_up_proj() — Decode 时 Q 计算
+# 预转置：process_weights_after_loading 时就转置好 W_UK
+# 避免每次 Decode 都做转置
+ql_nope = torch.bmm(q_nope, self.W_UK_T)   # W_UK_T 形如 [1, nope_dim, lora_rank]
+# → ql_nope 维度与 k_nope (lora_rank) 对齐，可直接做注意力得分
+```
+
+Decode 注意力因此变为：`ql_nope @ k_nope^T`（均为低秩维度），计算量大幅减少。
+
+**Ascend NPU 专属内核**：
+
+| 阶段 | 内核 | 说明 |
+|------|------|------|
+| Prefill | `torch_npu.atb.npu_ring_mla()` | Ring-based MLA，支持超长序列分块流水 |
+| Decode | `torch_npu.npu_fused_infer_attention_score()` | 融合注意力打分，减少 HBM 读写 |
+| KV 写入 | `torch_npu._npu_reshape_and_cache()` | 高效写入 k_nope/k_pe 到 block cache |
+| Q/K RMSNorm+RoPE | `torch_npu.npu_kv_rmsnorm_rope_cache()` | 融合 prefill 时的 RMSNorm + RoPE + 写 cache |
+
+**NZ 格式支持**（可选，`mla_v1.py:1177-1187`）：
+
+```python
+if self.enable_nz:
+    # Fractal (NZ) layout：将 kv_lora_rank 拆为 [lora_rank//16, block_size, 16]
+    # 优点：NPU 矩阵运算的原生 tile 格式，访问效率更高
+    k_nope_shape = (num_blocks, num_kv_heads, kv_lora_rank // 16, block_size, 16)
+```
+
+**vllm-ascend MLA 与上游差异汇总**：
+
+```mermaid
+flowchart LR
+    subgraph Upstream["上游 vLLM MLAAttentionImpl"]
+        U1["KV Cache: 单张量<br/>[block_size, lora_rank+rope_dim]"]
+        U2["kv_b_proj 在 FlashAttention 内核内展开"]
+    end
+    subgraph Ascend["vllm-ascend AscendMLAImpl"]
+        A1["KV Cache: 双张量<br/>k_nope[…,lora_rank] + k_pe[…,rope_dim]"]
+        A2["W_UK_T 预转置，Decode 走低秩注意力"]
+        A3["NPU 融合内核：ring_mla / fused_infer_attention"]
+        A4["NZ 格式可选，节省内存带宽"]
+        A1 --> A2 --> A3 --> A4
+    end
+    Upstream -.->|"继承并扩展"| Ascend
+```
+
+#### 12.4.5 长上下文：Context Parallel（CP）for MLA
+
+> 源码：`vllm_ascend/attention/context_parallel/mla_cp.py`
+
+**问题**：对于 1M token 级别的超长上下文（RAG、长文档处理），单个 NPU 的 HBM 无法同时存放完整的 KV Cache。
+
+**解决方案**：PCP（Prefill Context Parallel）—— 将序列分段，由多个 NPU 协同处理同一个 Prefill：
+
+```mermaid
+flowchart TD
+    subgraph Input["输入序列（1M tokens）"]
+        direction LR
+        T0["T0~T249K"] --- T1["T250K~T499K"] --- T2["T500K~T749K"] --- T3["T750K~T999K"]
+    end
+
+    subgraph PCP["PCP 组（4 个 NPU 协同 Prefill）"]
+        N0["NPU_0<br/>处理 T0,T4,T8…<br/>（交错分配）"]
+        N1["NPU_1<br/>处理 T1,T5,T9…"]
+        N2["NPU_2<br/>处理 T2,T6,T10…"]
+        N3["NPU_3<br/>处理 T3,T7,T11…"]
+    end
+
+    N0 <-->|"All-Gather KV"| N1
+    N1 <-->|"All-Gather KV"| N2
+    N2 <-->|"All-Gather KV"| N3
+
+    T0 --> N0
+    T1 --> N1
+    T2 --> N2
+    T3 --> N3
+```
+
+**Block 大小计算**（`mla_cp.py:65-73`）：
+
+```python
+cp_local_block_size   = block_size            # 单 NPU 本地 block 粒度
+cp_virtual_block_size = (
+    cp_local_block_size * dcp_size * pcp_size  # 跨 NPU 的逻辑 block 大小
+)
+# dcp_size: Decode-Context-Parallel 组大小
+# pcp_size: Prefill-Context-Parallel 组大小
+```
+
+**关键操作**（`mla_cp.py:408-412`）：
+
+```python
+# 每个 PCP rank 计算完自己的局部 KV 后，All-Gather 到全组
+# 确保每个 NPU 都能看到完整的历史 KV（Causal Attention 需要）
+kv_c_normed = all_gather(local_kv_c, pcp_group)   # [total_T, kv_lora_rank]
+k_pe        = all_gather(local_k_pe, pcp_group)    # [total_T, rope_dim]
+```
+
+**使用场景**：
+
+| 场景 | pcp_size | dcp_size | 总 NPU 数 |
+|------|----------|----------|-----------|
+| 普通长上下文（< 128K） | 1 | 1 | TP 张量并行 |
+| 长上下文 Prefill（< 2M） | 4~8 | 1 | pcp_size × TP |
+| 长上下文 Decode（高并发） | 1 | 4~8 | dcp_size × TP |
+| 超长上下文（> 2M） | 8 | 4 | pcp_size × dcp_size × TP |
+
 ### 12.5 从零实现：Mini MLA
 
 **设计目标**：端到端实现 MLA 的 Prefill + Decode 路径，包括解耦 RoPE 和 KV Cache 存储。
@@ -967,6 +1095,14 @@ class KVConnectorBase_V1(ABC):
 
 #### 13.3.3 Mooncake 实现（基于 RDMA 的高速传输）
 
+> **深度解析参见《博客第二部分》第 7 章**，其中覆盖了：
+> - **7.3.1**：上游 vLLM P-push（RDMA WRITE）
+> - **7.3.5**：vllm-ascend D-pull（RDMA READ）及异构 TP 支持
+> - **7.3.7**：逐层传输（Layerwise Connector）
+> - **7.6**：vllm-ascend AscendStore 分布式 KV 池
+
+此处给出一个简化版示意，帮助理解整体思路：
+
 Mooncake 实现了 KVConnectorBase_V1，将 KV Cache 以 block 为单位存入分布式 KV Store：
 
 ```python
@@ -1043,6 +1179,74 @@ class MooncakeConnector(KVConnectorBase_V1):
   2. D-Node 可同时服务多个 req 的 decode（延迟 ↓）
   3. P-Node 和 D-Node 可以用不同硬件配置
 ```
+
+#### 13.3.5 MLA + PD 分离：传输格式的特殊处理
+
+MLA 的压缩存储对 PD 分离的网络传输有直接影响：**传输量减少 7x 以上**。
+
+**传输内容对比**（DeepSeek V3，64 heads，每 token 每层）：
+
+```
+标准 MHA：
+  传输 k_cache + v_cache（全量）
+  = num_heads × head_dim × 2 × fp16
+  = 64 × 128 × 2 × 2 = 32,768 字节/token/层
+
+MLA（实际 vllm-ascend 传输内容）：
+  传输 k_nope（kv_lora_rank）+ k_pe（qk_rope_head_dim）
+  = (512 + 64) × fp16
+  = 576 × 2 = 1,152 字节/token/层
+
+节省比例：32,768 / 1,152 ≈ 28x ！（每层）
+```
+
+注意：传输的是**压缩表示**（c_kv + k_rope），而不是展开后的完整 K/V。D-node 收到后，在每次 Decode attention 时实时展开（同样执行 `kv_b_proj`）。
+
+**vllm-ascend pool_worker.py 对 MLA 的特殊处理**（`pool_worker.py:57-178`）：
+
+```python
+# pool_worker.py:88-98 — 检测 MLA 模型
+if self.use_mla or self.use_sparse:
+    # MLA 有多个子 KV cache（k_nope cache + k_pe cache）
+    for i in range(len(first_kv_cache_tuple)):
+        block_shape = first_kv_cache_tuple[i].shape[-3:]  # [num_kv_heads, block_size, dim]
+        self.block_len.append(element_size * product(block_shape))
+    # ↑ 每个子 cache 分别计算 block_len，独立传输
+
+# 对比普通 MHA（单 cache）：
+# self.block_len = [element_size × block_size × num_kv_heads × head_dim]
+```
+
+**端到端 MLA PD 传输流程**：
+
+```mermaid
+sequenceDiagram
+    participant P as P-Node (Prefill)
+    participant Store as MooncakeStore / RDMA
+    participant D as D-Node (Decode)
+
+    Note over P: 每层 Attention 完成后
+    P->>P: save_kv_layer(layer_name, kv_tuple)
+    Note over P: kv_tuple = (k_nope_cache, k_pe_cache)
+    P->>Store: put(key, k_nope_addr, block_len_nope)<br/>RDMA 存入 k_nope
+    P->>Store: put(key, k_pe_addr, block_len_pe)<br/>RDMA 存入 k_pe（分开传输）
+
+    Note over D: start_load_kv() 触发
+    D->>Store: get(key) → k_nope
+    D->>Store: get(key) → k_pe
+    D->>D: 重建 kv_caches tuple<br/>(k_nope, k_pe)
+    Note over D: Decode attention 时实时展开
+    D->>D: k_full = kv_b_proj(k_nope) ∥ k_pe
+```
+
+**小结：MLA 对 PD 分离的影响**：
+
+| 指标 | MHA | MLA |
+|------|-----|-----|
+| 每 token 每层传输量 | ~32KB | ~1.1KB（-96%） |
+| KV cache 结构 | 单 tensor | 双 tensor（k_nope + k_pe） |
+| D-node 接收后操作 | 直接用 | 需实时展开 `kv_b_proj` |
+| P→D 带宽压力 | 高 | 极低，RDMA 可容纳更多并发 |
 
 ### 13.4 从零实现：全局 KV Cache 池（Mooncake 风格）
 
