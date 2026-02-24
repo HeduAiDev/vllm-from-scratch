@@ -33,12 +33,12 @@
 
 ```mermaid
 flowchart TD
-    R([root]) --> SYS["[SYS]\ncached block: #7\nref_count=3"]
-    SYS --> Q1["[Q1]\nBlock #12\nref_count=2"]
-    SYS --> Q2["[Q2]\n独立块"]
-    Q1 --> Q1a["[Q1_a]\n请求A独立块"]
-    Q1 --> Q1c["[Q1_c]\n请求C独立块"]
-    Q2 --> Q2b["[Q2_b]\n请求B独立块"]
+    R([root]) --> SYS["[SYS]<br/>cached block: #7<br/>ref_count=3"]
+    SYS --> Q1["[Q1]<br/>Block #12<br/>ref_count=2"]
+    SYS --> Q2["[Q2]<br/>独立块"]
+    Q1 --> Q1a["[Q1_a]<br/>请求A独立块"]
+    Q1 --> Q1c["[Q1_c]<br/>请求C独立块"]
+    Q2 --> Q2b["[Q2_b]<br/>请求B独立块"]
 
     style SYS fill:#d4edda,stroke:#28a745
     style Q1 fill:#d4edda,stroke:#28a745
@@ -66,14 +66,14 @@ vLLM 的实现没有用严格的 Radix Tree，而是用**块级哈希**近似实
 
 ```mermaid
 flowchart TD
-    KVM["KVCacheManager\nallocate_slots(request, num_new_tokens):\n1. compute_block_hashes(request.tokens)\n2. For each hash: get_cached() or allocate_new()\n3. 返回 slot_mapping"]
+    KVM["KVCacheManager<br/>allocate_slots(request, num_new_tokens):<br/>1. compute_block_hashes(request.tokens)<br/>2. For each hash: get_cached() or allocate_new()<br/>3. 返回 slot_mapping"]
 
     KVM --> BP
 
     subgraph BP["BlockPool"]
-        LRU["free_block_queue（LRU 双向链表）\n oldest ↔ B3 ↔ B7 ↔ B1 ↔ newest"]
-        CB["cached_blocks（哈希表）\nH0 → Block#7\nH1 → Block#23\n..."]
-        BL["blocks（全量）\nblock_id → Block(ref_count, hash, ...)"]
+        LRU["free_block_queue（LRU 双向链表）<br/> oldest ↔ B3 ↔ B7 ↔ B1 ↔ newest"]
+        CB["cached_blocks（哈希表）<br/>H0 → Block#7<br/>H1 → Block#23<br/>..."]
+        BL["blocks（全量）<br/>block_id → Block(ref_count, hash, ...)"]
     end
 
     LRU <-->|"cache hit: 从队列移除"| CB
@@ -135,15 +135,15 @@ Block 的生命周期分为四个阶段：
 ```mermaid
 stateDiagram-v2
     [*] --> FREE : 初始化
-    FREE --> ACTIVE : get_new_blocks()\nref_cnt = 1
+    FREE --> ACTIVE : get_new_blocks()<br/>ref_cnt = 1
 
-    ACTIVE --> FREE : free_blocks()\nref_cnt → 0\n加入 free_block_queue 尾部
+    ACTIVE --> FREE : free_blocks()<br/>ref_cnt → 0<br/>加入 free_block_queue 尾部
 
-    FREE --> FREE : 空间充裕\n留在队列等待复用（Prefix Cache）
+    FREE --> FREE : 空间充裕<br/>留在队列等待复用（Prefix Cache）
 
-    FREE --> EVICTED : 空间不足\npopleft() 驱逐\n从 cached_blocks 删除 hash
+    FREE --> EVICTED : 空间不足<br/>popleft() 驱逐<br/>从 cached_blocks 删除 hash
 
-    EVICTED --> ACTIVE : 分配给新请求\nget_new_blocks()
+    EVICTED --> ACTIVE : 分配给新请求<br/>get_new_blocks()
 
     note right of FREE
         位于 free_block_queue
@@ -612,22 +612,22 @@ docker exec vllm python3 -m pytest /mnt/esfs/master_work/vllm-from-scratch/02_kv
 
 ```mermaid
 flowchart TD
-    MS["全局 Metadata Server\netcd/Redis\nblock_hash → node_id, memory_addr, size, access_time\nAPI: publish() / query() / invalidate()"]
+    MS["全局 Metadata Server<br/>etcd/Redis<br/>block_hash → node_id, memory_addr, size, access_time<br/>API: publish() / query() / invalidate()"]
 
     MS -->|"元数据查询（μs 级）"| PW
     MS -->|"元数据查询（μs 级）"| DW
 
     subgraph PW["Prefill 节点（Node 0,1,...)"]
-        P1["① 计算 KV Cache\n② 发布到全局池\nGPU VRAM: 80GB\nCPU DRAM: 512GB"]
+        P1["① 计算 KV Cache<br/>② 发布到全局池<br/>GPU VRAM: 80GB<br/>CPU DRAM: 512GB"]
     end
 
     subgraph DW["Decode 节点（Node 4,5,...)"]
-        D1["② 接收 KV Cache\n③ 直接开始 Decode\nGPU VRAM: 80GB\nCPU DRAM: 512GB"]
+        D1["② 接收 KV Cache<br/>③ 直接开始 Decode<br/>GPU VRAM: 80GB<br/>CPU DRAM: 512GB"]
     end
 
-    PW -->|"RDMA WRITE\n100-400 Gbps\n延迟 2-5μs"| DW
+    PW -->|"RDMA WRITE<br/>100-400 Gbps<br/>延迟 2-5μs"| DW
 
-    PW --> STORE["分布式存储节点\nNVMe SSD: 2TB\n冷缓存层"]
+    PW --> STORE["分布式存储节点<br/>NVMe SSD: 2TB<br/>冷缓存层"]
 
     style MS fill:#cce5ff,stroke:#004085
     style PW fill:#d4edda,stroke:#155724
@@ -677,7 +677,7 @@ sequenceDiagram
         P->>P: TransferEngine.initialize(hostname, rdma)
         P->>P: 启动 MooncakeBootstrapServer (HTTP)
         P->>P: 启动 ZMQ ROUTER socket
-        P->>P: batch_register_memory(kv_data_ptrs)\n预注册 GPU 内存到 RDMA NIC
+        P->>P: batch_register_memory(kv_data_ptrs)<br/>预注册 GPU 内存到 RDMA NIC
 
         D->>D: TransferEngine.initialize(hostname, rdma)
         D->>D: batch_register_memory(kv_data_ptrs)
@@ -688,27 +688,27 @@ sequenceDiagram
         Note over P,D: 请求处理阶段
 
         Note over P: ① Scheduler 决策
-        P->>P: get_num_new_matched_tokens(request)\n检查 do_remote_prefill flag
-        P->>P: update_state_after_alloc()\n记录 request → local_block_ids
+        P->>P: get_num_new_matched_tokens(request)<br/>检查 do_remote_prefill flag
+        P->>P: update_state_after_alloc()<br/>记录 request → local_block_ids
 
         Note over D: ③ D-node 发送请求（异步）
         D->>BS: 连接 P-node bootstrap server
         BS-->>D: ZMQ side channel 地址
-        D->>ZMQ: MooncakeXferMetadata\nremote_hostname, remote_port\nreq_blocks, kv_caches_base_addr
+        D->>ZMQ: MooncakeXferMetadata<br/>remote_hostname, remote_port<br/>req_blocks, kv_caches_base_addr
 
         Note over P: ② P-node Prefill
         P->>P: Prefill 正常执行，GPU 计算 KV Cache
-        P->>P: request_finished()\nsend_meta.ready.set()
+        P->>P: request_finished()<br/>send_meta.ready.set()
 
         Note over P: ④ P-node 响应（sender_loop 异步）
         ZMQ-->>P: 接收 ZMQ 请求
         P->>P: 等待 send_meta.ready（等 Prefill 完成）
-        P->>P: _build_transfer_params()\n计算 src_ptrs / dst_ptrs\ngroup_concurrent_contiguous()
-        P->>D: RDMA WRITE\nbatch_transfer_sync_write(src_ptrs, dst_ptrs)\nP-node GPU → D-node GPU 内存
+        P->>P: _build_transfer_params()<br/>计算 src_ptrs / dst_ptrs<br/>group_concurrent_contiguous()
+        P->>D: RDMA WRITE<br/>batch_transfer_sync_write(src_ptrs, dst_ptrs)<br/>P-node GPU → D-node GPU 内存
 
         Note over D: ⑤ D-node 等待完成
-        D->>D: process_pulling_result()\nfinished_recving_reqs.add(req_id)
-        D->>D: get_finished() 通知调度器\nreq_id → RUNNING 状态，加入下一批次 Decode
+        D->>D: process_pulling_result()<br/>finished_recving_reqs.add(req_id)
+        D->>D: get_finished() 通知调度器<br/>req_id → RUNNING 状态，加入下一批次 Decode
     end
 ```
 
@@ -1124,14 +1124,14 @@ MISS            │ (更快)    │  (唯一选择) │
 ```mermaid
 flowchart TD
     subgraph SC["SimulatedCluster（模拟实现，不依赖真实 RDMA）"]
-        GMS["GlobalMetadataServer\n_blocks: dict[hash → KVBlockMeta(node_id, addr, ...)]\n_node_blocks: dict[node_id → list[hash]]（用于 LRU）\n方法：query_prefix() / publish() / unpublish()\n特性：线程安全（RLock），LRU 驱逐"]
+        GMS["GlobalMetadataServer<br/>_blocks: dict[hash → KVBlockMeta(node_id, addr, ...)]<br/>_node_blocks: dict[node_id → list[hash]]（用于 LRU）<br/>方法：query_prefix() / publish() / unpublish()<br/>特性：线程安全（RLock），LRU 驱逐"]
 
-        TE["TransferEngine\n后台工作线程池，模拟 RDMA 异步传输\n延迟：同机架 200μs，跨机架 1ms\n带宽：100 Gbps（根据 block 大小计算时延）\n方法：submit_transfer() / wait() / is_complete() / callback()"]
+        TE["TransferEngine<br/>后台工作线程池，模拟 RDMA 异步传输<br/>延迟：同机架 200μs，跨机架 1ms<br/>带宽：100 Gbps（根据 block 大小计算时延）<br/>方法：submit_transfer() / wait() / is_complete() / callback()"]
 
         subgraph Workers["vLLM Workers（每节点一个 MooncakeConnector）"]
-            MC1["MooncakeConnector (Node 0)\nget_num_new_matched_tokens()\n  → 查元数据 → 发起传输\nwait_for_kv()\n  → 等传输完成（WAITING_FOR_KV）\npublish_kv() → 发布到全局池"]
-            MC2["MooncakeConnector (Node 1)\n..."]
-            MC3["MooncakeConnector (Node N)\n..."]
+            MC1["MooncakeConnector (Node 0)<br/>get_num_new_matched_tokens()<br/>  → 查元数据 → 发起传输<br/>wait_for_kv()<br/>  → 等传输完成（WAITING_FOR_KV）<br/>publish_kv() → 发布到全局池"]
+            MC2["MooncakeConnector (Node 1)<br/>..."]
+            MC3["MooncakeConnector (Node N)<br/>..."]
         end
 
         GMS -->|"元数据查询"| TE
@@ -1246,13 +1246,13 @@ LLM 推理调度本质上是一个**在线装箱问题（Online Bin Packing）**
 stateDiagram-v2
     [*] --> WAITING : 新请求到达
 
-    WAITING --> RUNNING : schedule() 选中\n分配 KV Cache 块
+    WAITING --> RUNNING : schedule() 选中<br/>分配 KV Cache 块
 
-    RUNNING --> FINISHED : 生成 EOS\n或达到 max_tokens
+    RUNNING --> FINISHED : 生成 EOS<br/>或达到 max_tokens
 
-    RUNNING --> PREEMPTED : KV Cache 不足\n(OOM)
+    RUNNING --> PREEMPTED : KV Cache 不足<br/>(OOM)
 
-    PREEMPTED --> WAITING : 换出 KV Cache 到 CPU\n或直接丢弃（重计算）
+    PREEMPTED --> WAITING : 换出 KV Cache 到 CPU<br/>或直接丢弃（重计算）
 
     FINISHED --> [*] : 释放 KV Cache 块
 

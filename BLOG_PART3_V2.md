@@ -64,9 +64,9 @@ MoE FFN 层：
 
 ```mermaid
 flowchart TD
-    x[输入 x] --> SE[Shared Expert 共享专家\n每个 token 必然经过]
+    x[输入 x] --> SE[Shared Expert 共享专家<br/>每个 token 必然经过]
     x --> R[Router 路由器]
-    R --> EP[Routed Expert Pool\nTop-K 竞争\n存储专业知识]
+    R --> EP[Routed Expert Pool<br/>Top-K 竞争<br/>存储专业知识]
     SE --> ADD((加法合并))
     EP --> ADD
     ADD --> y[输出 y]
@@ -141,23 +141,23 @@ Step 5: 从这 2 个组的候选专家中，取最终 top_k=8 个专家
 ```mermaid
 flowchart TD
     subgraph Python["DeepseekV2MoE Python 层"]
-        SE2[shared_experts\nDeepseekV2MLP\n普通 MLP]
+        SE2[shared_experts<br/>DeepseekV2MLP<br/>普通 MLP]
         subgraph SFM["SharedFusedMoE"]
-            RL[ReplicatedLinear\ngate/router]
-            FM[FusedMoE Triton\n路由专家计算]
+            RL[ReplicatedLinear<br/>gate/router]
+            FM[FusedMoE Triton<br/>路由专家计算]
             RL --> FM
         end
     end
 
     subgraph EP["Expert Parallel 通信层（多节点时）"]
         direction LR
-        G0["GPU0\nExpert[0..63]"]
-        G1["GPU1\nExpert[64..127]"]
-        G2["GPU2\nExpert[128..191]"]
-        G3["GPU3\nExpert[192..255]"]
-        G0 <-->|All2All 分发/汇聚\nNCCL| G1
-        G0 <-->|All2All 分发/汇聚\nNCCL| G2
-        G0 <-->|All2All 分发/汇聚\nNCCL| G3
+        G0["GPU0<br/>Expert[0..63]"]
+        G1["GPU1<br/>Expert[64..127]"]
+        G2["GPU2<br/>Expert[128..191]"]
+        G3["GPU3<br/>Expert[192..255]"]
+        G0 <-->|All2All 分发/汇聚<br/>NCCL| G1
+        G0 <-->|All2All 分发/汇聚<br/>NCCL| G2
+        G0 <-->|All2All 分发/汇聚<br/>NCCL| G3
     end
 
     Python --> EP
@@ -296,14 +296,14 @@ flowchart TD
     subgraph MoELayer["MoELayer"]
         IN["input_x [T, D]"]
 
-        IN --> SEXP["shared_expert\nExpert MLP"]
-        IN --> ROUTER["router\nTopKRouter /\nGroupedTopKRouter"]
+        IN --> SEXP["shared_expert<br/>Expert MLP"]
+        IN --> ROUTER["router<br/>TopKRouter /<br/>GroupedTopKRouter"]
 
         SEXP --> SHOUT["shared_out"]
 
-        ROUTER --> TOPK["topk_ids [T, K]\ntopk_weights [T, K]"]
+        ROUTER --> TOPK["topk_ids [T, K]<br/>topk_weights [T, K]"]
 
-        TOPK --> DISPATCH["Expert Dispatch\nfor e in E:\n  tokens → e\n  e(tokens) → o"]
+        TOPK --> DISPATCH["Expert Dispatch<br/>for e in E:<br/>  tokens → e<br/>  e(tokens) → o"]
 
         DISPATCH --> ROUT["routed_out [T, D]"]
 
@@ -527,7 +527,7 @@ flowchart LR
         P_IN --> PKV
         P_CKV --> P_KVCACHE[("存入 KV Cache")]
         P_KR --> P_KVCACHE
-        P_QB --> P_FA["FlashAttention\nkv_b_proj 展开 c_kv → K,V"]
+        P_QB --> P_FA["FlashAttention<br/>kv_b_proj 展开 c_kv → K,V"]
         P_CKV --> P_FA
     end
 
@@ -535,11 +535,11 @@ flowchart LR
         direction TB
         D_IN["hidden_states [1, D]"]
         D_Q["Q 计算（同 Prefill）"]
-        D_KVCACHE[("从 KV Cache 读取\n历史 c_kv, k_rope")]
-        D_KVB["kv_b_proj c_kv\n→ K_nope, V（实时展开）"]
-        D_ROPE["apply_rope k_rope\n→ K_rope"]
+        D_KVCACHE[("从 KV Cache 读取<br/>历史 c_kv, k_rope")]
+        D_KVB["kv_b_proj c_kv<br/>→ K_nope, V（实时展开）"]
+        D_ROPE["apply_rope k_rope<br/>→ K_rope"]
         D_KFULL["K = K_nope 拼接 K_rope"]
-        D_ATTN["PagedAttention\n使用 block_table 读取历史块"]
+        D_ATTN["PagedAttention<br/>使用 block_table 读取历史块"]
 
         D_IN --> D_Q
         D_IN --> D_KVCACHE
@@ -650,10 +650,10 @@ flowchart TD
     HS["hidden_states [B, T, D]"]
 
     HS --> QA["q_a_proj [B,T,L]"]
-    HS --> KVA["kv_a_proj_with_mqa\n[B, T, lora+rope]"]
+    HS --> KVA["kv_a_proj_with_mqa<br/>[B, T, lora+rope]"]
 
     QA --> QN["q_a_layernorm"]
-    QN --> QB["q_b_proj\n[B,T,H,nope+rope]"]
+    QN --> QB["q_b_proj<br/>[B,T,H,nope+rope]"]
 
     QB --> QNOPE["q_nope [B,T,H,nope]"]
     QB --> QROPE["q_rope [B,T,H,rope]"]
@@ -677,7 +677,7 @@ flowchart TD
     QNOPE --> QFULL["q_full = q_nope 拼接 q_rope_out"]
     QROPEOUT --> QFULL
 
-    QFULL --> ATTN["Attention\nQ @ K^T → softmax → @ V"]
+    QFULL --> ATTN["Attention<br/>Q @ K^T → softmax → @ V"]
     KFULL --> ATTN
     V --> ATTN
 
@@ -814,19 +814,19 @@ Decode 的特点：
 ```mermaid
 flowchart TD
     subgraph Cluster["生产 LLM 服务集群"]
-        subgraph PCluster["Prefill 节点集群\n高算力 GPU\n专注 Prefill\nBatch 大型请求"]
+        subgraph PCluster["Prefill 节点集群<br/>高算力 GPU<br/>专注 Prefill<br/>Batch 大型请求"]
             P0[P-Node 0]
             P1[P-Node 1]
             P2[P-Node 2]
         end
 
-        subgraph DCluster["Decode 节点集群\n高内存带宽 GPU\n持续流式输出\n服务 M 个并发对话"]
+        subgraph DCluster["Decode 节点集群<br/>高内存带宽 GPU<br/>持续流式输出<br/>服务 M 个并发对话"]
             D0[D-Node 0]
             D1[D-Node 1]
             D2[D-Node 2]
         end
 
-        META["全局元数据服务器\n类 Mooncake Store\n记录哪个 Prefill 节点有哪些 block\n路由请求到合适节点"]
+        META["全局元数据服务器<br/>类 Mooncake Store<br/>记录哪个 Prefill 节点有哪些 block<br/>路由请求到合适节点"]
 
         P0 -->|KV Cache RDMA| D0
         P1 -->|KV Cache RDMA| D1
@@ -1050,18 +1050,18 @@ class MooncakeConnector(KVConnectorBase_V1):
 
 ```mermaid
 flowchart TD
-    subgraph SimCluster["SimulatedCluster\n06_global_prefix_cache/global_kv_pool.py"]
+    subgraph SimCluster["SimulatedCluster<br/>06_global_prefix_cache/global_kv_pool.py"]
         subgraph PNodes["Prefill Nodes"]
-            PC["MooncakeConnector\npublish_kv"]
+            PC["MooncakeConnector<br/>publish_kv"]
         end
 
         subgraph DNodes["Decode Nodes"]
-            DC["MooncakeConnector\nget_matched_tokens\nwait_for_kv"]
+            DC["MooncakeConnector<br/>get_matched_tokens<br/>wait_for_kv"]
         end
 
-        META["GlobalMetadataServer\nblock_hash → node_id, token_ids\nLRU 淘汰 + 命中率统计 + 并发安全 RLock"]
+        META["GlobalMetadataServer<br/>block_hash → node_id, token_ids<br/>LRU 淘汰 + 命中率统计 + 并发安全 RLock"]
 
-        TE["TransferEngine\n异步 worker thread 模拟 RDMA 传输\nsubmit_transfer → transfer_id\nwait tid, timeout → TransferResult"]
+        TE["TransferEngine<br/>异步 worker thread 模拟 RDMA 传输<br/>submit_transfer → transfer_id<br/>wait tid, timeout → TransferResult"]
 
         PC -->|publish block_hash| META
         DC -->|query_prefix| META
@@ -1210,7 +1210,7 @@ flowchart LR
     subgraph V0["V0 架构（旧）：单进程，同步"]
         direction TB
         V0_REQ["用户请求"]
-        V0_AE["AsyncLLMEngine\nblocking"]
+        V0_AE["AsyncLLMEngine<br/>blocking"]
         V0_LE["LLMEngine"]
         V0_EC["EngineCore"]
         V0_SC["Scheduler Python"]
@@ -1226,14 +1226,14 @@ flowchart LR
     subgraph V1["V1 架构（新）：多进程，异步"]
         direction TB
         V1_REQ["用户请求"]
-        V1_AE["AsyncLLMEngine\n非阻塞前端，独立进程"]
+        V1_AE["AsyncLLMEngine<br/>非阻塞前端，独立进程"]
         V1_EC["EngineCore 进程"]
-        V1_SC["Scheduler\n完全重写"]
-        V1_KV["KVCacheManager\n显式管理"]
+        V1_SC["Scheduler<br/>完全重写"]
+        V1_KV["KVCacheManager<br/>显式管理"]
         V1_ME["ModelExecutorV1"]
         V1_W["GPU Worker 进程群"]
-        V1_IB["InputBatch\nCUDA Graph Capture\nSampler\nRejectionSampler spec decode"]
-        V1_AB["Attention Backends\nMLA / MHA / Flash\nMoE / FusedMoE"]
+        V1_IB["InputBatch<br/>CUDA Graph Capture<br/>Sampler<br/>RejectionSampler spec decode"]
+        V1_AB["Attention Backends<br/>MLA / MHA / Flash<br/>MoE / FusedMoE"]
 
         V1_REQ --> V1_AE
         V1_AE -->|ZeroMQ IPC| V1_EC
@@ -1263,18 +1263,18 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    USER["用户侧\nengine.generate('Hello, world', sampling_params)"]
+    USER["用户侧<br/>engine.generate('Hello, world', sampling_params)"]
 
-    USER --> AE["AsyncLLMEngine 前端进程\n管理并发请求\n流式返回 token\n处理超时/取消"]
+    USER --> AE["AsyncLLMEngine 前端进程<br/>管理并发请求<br/>流式返回 token<br/>处理超时/取消"]
 
     AE -->|ZeroMQ PUSH| EC["EngineCore 独立进程"]
 
     subgraph Loop["推理主循环（每步）"]
-        SC["1. Scheduler.schedule()\n选择本步要处理的请求\n分配/释放 KV Cache blocks\n决定 chunked prefill 的 chunk 大小\n投机解码：决定 draft token 数\n→ SchedulerOutput"]
+        SC["1. Scheduler.schedule()<br/>选择本步要处理的请求<br/>分配/释放 KV Cache blocks<br/>决定 chunked prefill 的 chunk 大小<br/>投机解码：决定 draft token 数<br/>→ SchedulerOutput"]
 
-        ME["2. ModelExecutor.execute_model()\n构建 InputBatch token_ids, pos, ...\n推理（可能 CUDA Graph 加速）\nSampling greedy/top-p/top-k\n如果投机解码：RejectionSampling\n→ ModelRunnerOutput"]
+        ME["2. ModelExecutor.execute_model()<br/>构建 InputBatch token_ids, pos, ...<br/>推理（可能 CUDA Graph 加速）<br/>Sampling greedy/top-p/top-k<br/>如果投机解码：RejectionSampling<br/>→ ModelRunnerOutput"]
 
-        UPD["3. Scheduler.update_from_output()\n更新 num_computed_tokens\n完成的请求：释放 KV blocks\n更新 prefix cache hash 表\n投机解码：统计接受率"]
+        UPD["3. Scheduler.update_from_output()<br/>更新 num_computed_tokens<br/>完成的请求：释放 KV blocks<br/>更新 prefix cache hash 表<br/>投机解码：统计接受率"]
 
         STREAM["4. AsyncLLMEngine 读取输出，流式返回"]
 
@@ -1430,14 +1430,14 @@ flowchart TD
         subgraph Loop["推理主循环"]
             subgraph SC["Scheduler"]
                 SCQ["waiting / running 队列"]
-                SCA["BlockAllocator\nLRU + Prefix Cache"]
+                SCA["BlockAllocator<br/>LRU + Prefix Cache"]
                 SCC["Chunked Prefill 支持"]
             end
 
             subgraph MT["MiniTransformer"]
                 EMB["Embedding Layer"]
                 subgraph Layers["for layer in layers"]
-                    ATT["Attention MHA 简化版\n读写 KV Cache\n按 block_table 寻址"]
+                    ATT["Attention MHA 简化版<br/>读写 KV Cache<br/>按 block_table 寻址"]
                     FFN["FFN / MoE"]
                     ATT --> FFN
                 end
@@ -1446,7 +1446,7 @@ flowchart TD
                 FFN --> LMH
             end
 
-            SAMP["Sampler\nGreedy / Temperature\nTop-P / Top-K"]
+            SAMP["Sampler<br/>Greedy / Temperature<br/>Top-P / Top-K"]
             UPD["更新请求状态 → 循环"]
 
             SC -->|SchedulerOutput| MT
@@ -1458,7 +1458,7 @@ flowchart TD
         GEN --> Loop
     end
 
-    KVC[("外部 KV Cache GPU 内存\nkv_caches: List[(k_cache, v_cache)] 每层一个\nk_cache: [num_blocks, block_size, num_heads, head_dim]\nv_cache: [num_blocks, block_size, num_heads, head_dim]")]
+    KVC[("外部 KV Cache GPU 内存<br/>kv_caches: List[(k_cache, v_cache)] 每层一个<br/>k_cache: [num_blocks, block_size, num_heads, head_dim]<br/>v_cache: [num_blocks, block_size, num_heads, head_dim]")]
 
     ATT <-->|读写| KVC
 

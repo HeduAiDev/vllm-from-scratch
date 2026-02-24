@@ -105,7 +105,7 @@ vLLM 的架构对这三层都有对应的设计。
 ```mermaid
 flowchart TD
     subgraph Frontend["前端（用户接口层）"]
-        API["OpenAI Compatible API / AsyncLLMEngine / LLMEngine\n接收请求 → 异步队列 → 流式返回结果"]
+        API["OpenAI Compatible API / AsyncLLMEngine / LLMEngine<br/>接收请求 → 异步队列 → 流式返回结果"]
     end
 
     subgraph EngineCore["EngineCore（核心引擎，独立进程）"]
@@ -127,12 +127,12 @@ flowchart TD
             SMP["Sampler（贪心 / Top-P / Spec Decode）"]
         end
 
-        UPD["Scheduler.update_from_output()\n更新请求状态 / 释放完成请求的 KV Cache 块"]
+        UPD["Scheduler.update_from_output()<br/>更新请求状态 / 释放完成请求的 KV Cache 块"]
     end
 
     subgraph VRAM["GPU 显存布局"]
-        MW["模型权重\n~60-80%"]
-        KVC["KV Cache 块池\nBlock0, Block1, Block2 ... BlockN\n~20-40% 显存"]
+        MW["模型权重<br/>~60-80%"]
+        KVC["KV Cache 块池<br/>Block0, Block1, Block2 ... BlockN<br/>~20-40% 显存"]
     end
 
     Frontend -->|"IPC 通信，独立进程"| EngineCore
@@ -204,14 +204,14 @@ vLLM 在 v0.6 之后引入了 V1 架构，进行了重大重构：
 flowchart LR
     subgraph V0["V0 架构（同步，单进程主导）"]
         direction LR
-        LE["LLMEngine\n同步调用"] -->|"阻塞等待"| W0["Worker"]
-        P0["问题：\n- CPU 调度时，GPU 空闲\n- 新请求到达时无法立即响应\n- Scheduler 和 Model Executor 紧耦合"]
+        LE["LLMEngine<br/>同步调用"] -->|"阻塞等待"| W0["Worker"]
+        P0["问题：<br/>- CPU 调度时，GPU 空闲<br/>- 新请求到达时无法立即响应<br/>- Scheduler 和 Model Executor 紧耦合"]
     end
 
     subgraph V1["V1 架构（异步，多进程）"]
         direction LR
-        FE["前端进程\nAsyncLLMEngine\n非阻塞 API"] <-->|IPC| EC["EngineCore 进程\nScheduler + Executor\n独立循环，连续 batch"]
-        P1["优势：\n- 前端可以持续接收请求，不受推理阻塞\n- Continuous Batching：每步都可以加入新请求\n- 更好的 CUDA Graph 支持"]
+        FE["前端进程<br/>AsyncLLMEngine<br/>非阻塞 API"] <-->|IPC| EC["EngineCore 进程<br/>Scheduler + Executor<br/>独立循环，连续 batch"]
+        P1["优势：<br/>- 前端可以持续接收请求，不受推理阻塞<br/>- Continuous Batching：每步都可以加入新请求<br/>- 更好的 CUDA Graph 支持"]
     end
 ```
 
@@ -235,24 +235,24 @@ PagedAttention 的灵感直接来自操作系统的**虚拟内存**机制。回�
 ```mermaid
 flowchart LR
     subgraph OS["OS 虚拟内存分页"]
-        VA["进程A的虚拟地址空间\n0x0000 ─── 0xFFFF"] -->|"页表映射"| PM["物理内存页\nP3, P7, --, P1"]
+        VA["进程A的虚拟地址空间<br/>0x0000 ─── 0xFFFF"] -->|"页表映射"| PM["物理内存页<br/>P3, P7, --, P1"]
     end
 
     subgraph PA["PagedAttention 的分页"]
-        LKV["逻辑 KV 序列（请求视角）\nK0,V0  K1,V1  K2,V2  K3,V3 ..."] -->|"Block Table 映射"| PKV["物理 KV 块（GPU 显存）\nBlock7  Block2  Block15 ..."]
-        BT["Block Table\n逻辑块0→7\n逻辑块1→2\n逻辑块2→15"]
+        LKV["逻辑 KV 序列（请求视角）<br/>K0,V0  K1,V1  K2,V2  K3,V3 ..."] -->|"Block Table 映射"| PKV["物理 KV 块（GPU 显存）<br/>Block7  Block2  Block15 ..."]
+        BT["Block Table<br/>逻辑块0→7<br/>逻辑块1→2<br/>逻辑块2→15"]
     end
 
     LKV --> BT --> PKV
 
-    note1["优势：\n1. KV Cache 无需连续，按 block 分配\n2. 不同请求共享相同前缀的物理 block（Prefix Cache）\n3. 无预留浪费，利用率接近 100%"]
+    note1["优势：<br/>1. KV Cache 无需连续，按 block 分配<br/>2. 不同请求共享相同前缀的物理 block（Prefix Cache）<br/>3. 无预留浪费，利用率接近 100%"]
 ```
 
 PagedAttention 把同样的思路用到了 KV Cache：
 
 ```mermaid
 flowchart LR
-    LKV0["K0,V0"] --> BT0["Block Table\n逻辑块0 → 物理块7"]
+    LKV0["K0,V0"] --> BT0["Block Table<br/>逻辑块0 → 物理块7"]
     LKV1["K1,V1"] --> BT1["逻辑块1 → 物理块2"]
     LKV2["K2,V2"] --> BT2["逻辑块2 → 物理块15"]
     LKV3["K3,V3 ..."] --> BT3["..."]
@@ -497,12 +497,12 @@ GPU 上形式 block_tables tensor             slot_mapping tensor
 
 ```mermaid
 flowchart LR
-    Q["新 token 的 Q\nshape: 1, num_heads, head_dim"]
+    Q["新 token 的 Q<br/>shape: 1, num_heads, head_dim"]
 
     subgraph BT["Kernel 遍历 block_table=[7, 23, 4]"]
-        B7["物理块7（逻辑块0）\nK[0..15], V[0..15]\ntoken 0-15"]
-        B23["物理块23（逻辑块1）\nK[0..15], V[0..15]\ntoken 16-31"]
-        B4["物理块4（逻辑块2）\nK[0..7], V[0..7]\ntoken 32-39"]
+        B7["物理块7（逻辑块0）<br/>K[0..15], V[0..15]<br/>token 0-15"]
+        B23["物理块23（逻辑块1）<br/>K[0..15], V[0..15]<br/>token 16-31"]
+        B4["物理块4（逻辑块2）<br/>K[0..7], V[0..7]<br/>token 32-39"]
     end
 
     Q -->|"Q·K^T / sqrt(d_k)"| B7
@@ -513,7 +513,7 @@ flowchart LR
     B23 --> ATTN
     B4 --> ATTN
 
-    ATTN --> OUT["输出\n1, num_heads, head_dim"]
+    ATTN --> OUT["输出<br/>1, num_heads, head_dim"]
 ```
 
 vLLM 使用 **FlashAttention** + 自定义 **Paged Attention Kernel** 实现这一计算：
@@ -530,16 +530,16 @@ vLLM 使用 **FlashAttention** + 自定义 **Paged Attention Kernel** 实现这�
 ```mermaid
 flowchart TD
     subgraph KVPool["KVCachePool"]
-        STORE["物理存储\nk_cache: num_blocks, block_size, heads, dim\nv_cache: num_blocks, block_size, heads, dim"]
-        FREE["空闲块管理\nfree_blocks: set of physical block IDs\nref_count: dict block_id → int"]
+        STORE["物理存储<br/>k_cache: num_blocks, block_size, heads, dim<br/>v_cache: num_blocks, block_size, heads, dim"]
+        FREE["空闲块管理<br/>free_blocks: set of physical block IDs<br/>ref_count: dict block_id → int"]
         METHODS["方法：allocate() / free() / write_kv() / read_kv()"]
     end
 
-    RS["Request State\nblock_table: [7, 23, 4]\nnum_computed: 39"]
+    RS["Request State<br/>block_table: [7, 23, 4]<br/>num_computed: 39"]
 
     subgraph PA["PagedAttention"]
-        PF["prefill_forward()\n→ Flash Attention\n→ Write K,V to cache"]
-        DF["decode_forward()\n→ Read K,V from cache\n→ Attention over all"]
+        PF["prefill_forward()<br/>→ Flash Attention<br/>→ Write K,V to cache"]
+        DF["decode_forward()<br/>→ Read K,V from cache<br/>→ Attention over all"]
     end
 
     KVPool --> RS
@@ -785,10 +785,10 @@ stateDiagram-v2
     POOL --> ALLOCATED : allocate()
     note right of ALLOCATED : 已分配给某请求
 
-    ALLOCATED --> CACHED : request finished\nmark_cached()
+    ALLOCATED --> CACHED : request finished<br/>mark_cached()
     note right of CACHED : LRU 候选池
 
-    CACHED --> POOL : free()\nref_count→0
+    CACHED --> POOL : free()<br/>ref_count→0
 
     CACHED --> EVICTED : evict()
     CACHED --> ALLOCATED : cache_hit()
@@ -834,17 +834,17 @@ class BlockPool:
 ```mermaid
 flowchart TD
     subgraph BlockPoolLRU["BlockPoolLRU 内部数据结构"]
-        BP["block_pool: dict[block_id → Block]\n每个 Block 记录：ref_count, hash, prev, next"]
+        BP["block_pool: dict[block_id → Block]<br/>每个 Block 记录：ref_count, hash, prev, next"]
 
-        CB["cached_blocks: dict[hash → Block]\nPrefix Cache：hash → 物理块（快速查找）"]
+        CB["cached_blocks: dict[hash → Block]<br/>Prefix Cache：hash → 物理块（快速查找）"]
 
         subgraph LRU["LRU Free Queue（双向链表）"]
-            HEAD["HEAD\n驱逐时从此取"] <-->|双向链表| OLD["最旧的空闲块"]
+            HEAD["HEAD<br/>驱逐时从此取"] <-->|双向链表| OLD["最旧的空闲块"]
             OLD <-->|"..."| NEW["最近释放的块"]
             NEW <--> TAIL["TAIL"]
         end
 
-        INV["总体不变量：\nref_count > 0 → 块被某请求持有（不可驱逐）\nref_count == 0 → 块在 LRU 队列中（可被驱逐或复用）"]
+        INV["总体不变量：<br/>ref_count > 0 → 块被某请求持有（不可驱逐）<br/>ref_count == 0 → 块在 LRU 队列中（可被驱逐或复用）"]
     end
 ```
 
