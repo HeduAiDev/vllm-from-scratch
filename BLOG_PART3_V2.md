@@ -1099,7 +1099,8 @@ class KVConnectorBase_V1(ABC):
 > - **7.3.1**：上游 vLLM P-push（RDMA WRITE）
 > - **7.3.5**：vllm-ascend D-pull（RDMA READ）及异构 TP 支持
 > - **7.3.7**：逐层传输（Layerwise Connector）
-> - **7.6**：vllm-ascend AscendStore 分布式 KV 池
+> - **7.6**：LMCache + MooncakeStore 主流全局 KV 池方案（NVIDIA GPU）
+> - **7.7**：vllm-ascend AscendStore 分布式 KV 池（Ascend NPU）
 
 此处重点厘清 **V0 vs V1 接口演进**，以及 MooncakeConnector（P2P）与 LMCache（全局存储池）的本质区别：
 

@@ -812,7 +812,7 @@ schedule() {                          execute_model() {
 - 可插拔后端（MooncakeDistributedStore / Memcache）
 - 源码：`vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/`
 
-详细实现见 §7.3.5（D-pull）、§7.3.6（异构TP）、§7.3.7（逐层传输）、§7.6（AscendStore）。
+详细实现见 §7.3.5（D-pull）、§7.3.6（异构TP）、§7.3.7（逐层传输）、§7.6（LMCache+MooncakeStore）、§7.7（AscendStore）。
 
 #### 7.2.5 全局 KV 池的理想架构
 
@@ -863,7 +863,7 @@ flowchart TD
 | **传输方向** | P push（RDMA WRITE） | D pull（RDMA READ） |
 | **异构 TP** | ❌ NotImplementedError | ✅ P_tp ≥ D_tp，P_tp % D_tp == 0 |
 | **逐层传输** | ❌ | ✅ LayerwiseConnector |
-| **全局 KV 池** | ❌（仅 P2P） | ✅ AscendStore（见 7.6） |
+| **全局 KV 池** | ❌（仅 P2P） | ✅ AscendStore（见 7.7） |
 
 #### 7.3.1 上游 vLLM：P 主动推送（RDMA WRITE）
 
@@ -1908,13 +1908,710 @@ def wait_for_kv(self, request_id: str, timeout: float = 5.0) -> bool:
   节省计算：254ms × 2 = 508ms
 ```
 
-### 7.6 vllm-ascend AscendStore：真实全局 KV 池实现
+### 7.6 LMCache + MooncakeStore：主流全局 KV 池方案
+
+> 参考：[Mooncake 官方文档 — vLLM V1 Disaggregated Serving with LMCache](https://kvcache-ai.github.io/Mooncake/getting_started/examples/vllm-integration/vllmv1-lmcache-integration.html)
+> 源码：`lmcache/integration/vllm/`、`lmcache/storage/remote/mooncake_store_connector.py`
+
+§7.3 介绍的 `MooncakeConnector` 是纯 P2P 方案：Prefiller 把 KV 直接推给 Decoder，每次请求传输一次，不能复用。而 **LMCache + MooncakeStore** 是真正的全局 KV 池：KV 写入持久化的分布式 DRAM 存储，任意 Decoder 都可读取，跨请求复用相同前缀的 KV，这才是 NVIDIA GPU 集群上最主流的全局池化方案。
+
+#### 7.6.1 为什么 P2P 不够：三个核心局限
+
+| 局限 | P2P MooncakeConnector | LMCache + MooncakeStore |
+|------|----------------------|------------------------|
+| **跨请求复用** | ❌ 每次都传输全部 KV | ✅ 相同前缀只存一次，命中直接读 |
+| **XP:YD 部署** | ❌ 强耦合 1P:1D 配对 | ✅ 任意 P 写入，任意 D 读取 |
+| **时序耦合** | P 必须等 D 确认收到 | P 写完即结束；D 独立读取 |
+| **传输次数** | N 个请求 = N 次 RDMA | M 个唯一前缀 = M 次写入 |
+
+**典型收益场景**：同一系统提示词被 100 个并发请求共用。P2P 方案需传输 100 次；LMCache+MooncakeStore 只传输 1 次，后续 99 次全部命中。
+
+---
+
+#### 7.6.2 完整四层架构
+
+```
+vLLM V1 Scheduler/Worker
+        │
+        │  KVConnectorBase_V1 接口
+        ▼
+LMCacheConnectorV1          ← vLLM 插件入口（lmcache/integration/vllm/）
+        │
+        │  LMCacheConnectorV1Impl（实际实现）
+        ▼
+LMCache StorageManager      ← KV 分块、前缀感知查找（ChunkedTokenDatabase）
+        │
+        ├── LocalCPUBackend（可选：DRAM 本地缓存层）
+        │
+        └── RemoteBackend
+                │
+                │  RemoteConnector 抽象接口
+                ▼
+        MooncakeStoreConnector  ← 适配器：RemoteConnector → MooncakeDistributedStore
+                │
+                ▼
+        MooncakeDistributedStore（client，嵌入 vLLM 进程内）
+                │
+                │  RDMA / TCP Transfer Engine
+                ▼
+        mooncake_master（独立进程）+ etcd（元数据）
+        ← 管理所有节点的显存/内存注册、key→location 映射
+```
+
+**与 §7.7 vllm-ascend AscendStore 的架构对比：**
+
+| | LMCache + MooncakeStore | vllm-ascend AscendStore |
+|--|------------------------|------------------------|
+| 中间层 | LMCache StorageManager（有 LocalBuffer） | 无中间层（直接 ZMQ + 传输线程） |
+| 存储键 | `chunk_hash`（LMCache 内部管理） | `PoolKey.to_string()`（SHA-256，含 tp_rank） |
+| 调度器查询 | 进程内查询（无 ZMQ） | ZMQ intra-node REQ/REP |
+| 适用硬件 | NVIDIA GPU（主流） | 华为 Ascend NPU |
+| 额外 memcpy | LocalBuffer 存在一次 CPU 中转 | 无，直接 GPU↔Store RDMA |
+
+---
+
+#### 7.6.3 RemoteConnector：LMCache 的可插拔存储接口
+
+LMCache 定义了 `RemoteConnector` 抽象类，任何远端存储都只需实现这 4 个方法：
+
+```python
+# lmcache/storage/remote/base_connector.py
+from abc import ABC, abstractmethod
+from typing import Any, Optional
+from lmcache.storage.mem_obj import MemoryObj
+
+class RemoteConnector(ABC):
+
+    @abstractmethod
+    def exists(self, key: str) -> bool:
+        """检查指定 key 是否已在远端存储中"""
+        ...
+
+    @abstractmethod
+    def put(self, key: str, metadata: Any, kvbytes: bytes) -> None:
+        """将 KV 数据（含元数据头）写入远端存储"""
+        ...
+
+    @abstractmethod
+    def get(self, key: str) -> Optional[MemoryObj]:
+        """从远端存储读取 KV，返回 LMCache 管理的 MemoryObj；未找到返回 None"""
+        ...
+
+    @abstractmethod
+    def close(self) -> None:
+        """清理资源，关闭连接"""
+        ...
+```
+
+URL scheme 决定使用哪个 `RemoteConnector` 实现：
+- `mooncakestore://master_ip:50051/` → `MooncakeStoreConnector`
+- `redis://localhost:6379/` → `RedisConnector`
+- `infinistore://localhost:8080/` → `InfiniStoreConnector`
+
+---
+
+#### 7.6.4 MooncakeStoreConnector 完整实现
+
+```python
+# lmcache/storage/remote/mooncake_store_connector.py
+
+import os
+import json
+import logging
+from typing import Any, Optional
+
+from lmcache.storage.mem_obj import MemoryObj
+from lmcache.storage.remote.base_connector import RemoteConnector
+from lmcache.utils import CacheEngineKey
+
+logger = logging.getLogger(__name__)
+
+class MooncakeStoreConnector(RemoteConnector):
+    """
+    LMCache RemoteConnector 实现：使用 MooncakeDistributedStore 作为远端后端。
+
+    架构位置：
+      LMCache StorageManager → RemoteBackend → MooncakeStoreConnector
+                                                       ↓
+                                             MooncakeDistributedStore
+                                             （嵌入式 client，RDMA/TCP 传输）
+    """
+
+    def __init__(self, url: str, extra_config: dict):
+        """
+        初始化分三步：
+          1. 验证依赖（mooncake-transfer-engine 是否已安装）
+          2. 加载配置（优先使用 extra_config，其次读 MOONCAKE_CONFIG_PATH）
+          3. 初始化 MooncakeDistributedStore client
+
+        Args:
+            url:          形如 "mooncakestore://192.168.1.100:50052/"
+            extra_config: 来自 LMCache YAML 的 extra_config 字段
+        """
+        # ── Step 1：验证依赖 ─────────────────────────────────────
+        try:
+            from mooncake.store import MooncakeDistributedStore
+        except ImportError:
+            raise ImportError(
+                "mooncake-transfer-engine 未安装。请运行：\n"
+                "  pip install mooncake-transfer-engine"
+            )
+
+        # ── Step 2：解析配置 ─────────────────────────────────────
+        # extra_config 优先（来自 YAML）；其次从 MOONCAKE_CONFIG_PATH 读取
+        cfg = self._load_config(extra_config)
+
+        # 从 URL 中解析 master 地址（如果 extra_config 未覆盖）
+        if "master_server_address" not in cfg:
+            # url = "mooncakestore://192.168.1.100:50052/"
+            host_port = url.split("://")[1].rstrip("/")
+            cfg["master_server_address"] = host_port
+
+        # ── Step 3：初始化分布式存储 ─────────────────────────────
+        self.store = MooncakeDistributedStore()
+        self.store.setup(
+            local_hostname=cfg["local_hostname"],
+            metadata_server=cfg["metadata_server"],
+            global_segment_size=cfg.get("global_segment_size", 32 * 1024**3),
+            local_buffer_size=cfg.get("local_buffer_size", 1 * 1024**3),
+            protocol=cfg.get("protocol", "rdma"),
+            rdma_devices=cfg.get("device_name", ""),
+            master_server_addr=cfg["master_server_address"],
+        )
+        logger.info(f"MooncakeStoreConnector 初始化完成，master={cfg['master_server_address']}")
+
+    def _load_config(self, extra_config: dict) -> dict:
+        """从 extra_config 或 MOONCAKE_CONFIG_PATH 加载配置"""
+        if extra_config:
+            return extra_config
+        config_path = os.environ.get("MOONCAKE_CONFIG_PATH")
+        if config_path:
+            with open(config_path) as f:
+                return json.load(f)
+        raise RuntimeError(
+            "缺少 Mooncake 配置：请设置 MOONCAKE_CONFIG_PATH 或"
+            " 在 LMCache YAML 中提供 extra_config"
+        )
+
+    def exists(self, key: str) -> bool:
+        """检查 key 是否已在 MooncakeStore 中（任意节点上）"""
+        result = self.store.is_exist(key)
+        return result == 1   # 1=存在，0=不存在，-1=错误
+
+    def put(self, key: str, metadata: Any, kvbytes: bytes) -> None:
+        """
+        将 KV 数据写入 MooncakeStore（分布式 DRAM 池）。
+
+        LMCache 会在 metadata 头部记录 chunk_size、dtype、shape 等信息，
+        与 kvbytes 打包后一起写入，方便 Decoder 直接解析。
+        """
+        import pickle
+        # 将 metadata 序列化并和 KV bytes 打包
+        meta_bytes = pickle.dumps(metadata)
+        payload = len(meta_bytes).to_bytes(8, "little") + meta_bytes + kvbytes
+
+        # 写入 MooncakeStore（store 会选择一个本地或就近节点存储）
+        self.store.put(key, payload)
+
+    def get(self, key: str) -> Optional[MemoryObj]:
+        """
+        从 MooncakeStore 读取 KV。
+        store 自动路由到存有该 key 的节点，通过 RDMA 拉取数据。
+        """
+        import pickle
+        payload = self.store.get(key)
+        if payload is None:
+            return None
+
+        # 解析 payload：metadata 长度 + metadata + kvbytes
+        meta_len = int.from_bytes(payload[:8], "little")
+        metadata = pickle.loads(payload[8:8 + meta_len])
+        kvbytes   = payload[8 + meta_len:]
+
+        return MemoryObj(metadata=metadata, data=kvbytes)
+
+    def close(self) -> None:
+        """关闭 MooncakeDistributedStore 连接"""
+        self.store.close()
+```
+
+---
+
+#### 7.6.5 请求生命周期：逐层存取流水线
+
+LMCache 的关键优化是**逐层（per-layer）存取**，允许 KV IO 与模型计算重叠。
+
+**Prefiller 侧：逐层写入**
+
+```python
+# LMCacheConnectorV1 worker-side（简化版）
+
+def save_kv_layer(
+    self,
+    layer_name: str,
+    kv_layer: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    **kwargs,
+) -> None:
+    """
+    在模型前向传播的每一层 Attention 结束后调用。
+    LMCache 异步把这一层的 KV 块发给 StorageManager（不阻塞计算）。
+
+    流水线效果：
+      GPU:    Attn_0 → Attn_1 → Attn_2 → ...
+      LMCache:   ↓save    ↓save    ↓save      （与 GPU 计算并行）
+    """
+    self._lmcache_engine.store_kv_layer(
+        layer_name=layer_name,
+        kv_layer=kv_layer,          # 当前层的 KV 张量（来自 paged KV buffer）
+        attn_metadata=attn_metadata,
+    )
+
+def wait_for_save(self) -> None:
+    """forward pass 退出时调用，等待所有层的 put 操作完成"""
+    self._lmcache_engine.wait_for_save()
+```
+
+**Decoder 侧：逐层加载**
+
+```python
+def start_load_kv(
+    self,
+    forward_context: ForwardContext,
+    **kwargs,
+) -> None:
+    """
+    forward pass 开始前调用。
+    LMCache 异步为每个命中请求从 MooncakeStore 拉取 KV，
+    按层写入 vLLM 的 paged KV buffer。
+    """
+    # 从 forward_context 中获取本 batch 中有 KV 命中的请求列表
+    for request_id, load_spec in forward_context.connector_metadata.items():
+        self._lmcache_engine.retrieve_kv_async(
+            request_id=request_id,
+            block_ids=load_spec.block_ids,
+            block_hashes=load_spec.block_hashes,
+        )
+
+def wait_for_layer_load(self, layer_name: str) -> None:
+    """
+    在每个 Attention 层开始前调用。
+    等待该层的 KV 已从 MooncakeStore 加载完毕。
+
+    流水线效果：
+      LMCache:  load_layer_0 → load_layer_1 → load_layer_2 → ...
+      GPU:           ↓wait         ↓wait          ↓wait       （有 KV 才开始计算）
+      GPU Attn:  Attn_0        Attn_1          Attn_2
+    """
+    self._lmcache_engine.wait_for_layer(layer_name)
+```
+
+**端到端时序**
+
+```
+Prefiller                     MooncakeStore              Decoder
+──────────────────────────────────────────────────────────────────
+Attn_0 → save_kv_layer(0) ──→ put(key_0, kv_0)
+Attn_1 → save_kv_layer(1) ──→ put(key_1, kv_1)
+...
+Attn_N → save_kv_layer(N) ──→ put(key_N, kv_N)
+wait_for_save() ─────────────────────────────────────────────────→
+
+                              ← get_num_new_matched_tokens() 查询 ─
+                                   is_exist(key_0..N) → 全部命中
+                              start_load_kv() ← ─────────────────
+                              get(key_0) ──────────────────────────→ wait_for_layer_load(0)
+                              get(key_1) ──────────────────────────→ wait_for_layer_load(1) → Attn_1
+                              ...
+──────────────────────────────────────────────────────────────────
+净效果：Decoder 跳过全部 Prefill 计算，转换为 N 次 RDMA 读取
+```
+
+---
+
+#### 7.6.6 部署配置
+
+**Step 1：启动 Mooncake Master（Machine A，Decoder 同机）**
+
+```bash
+mooncake_master \
+  -port 50052 \
+  -max_threads 64 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080
+```
+
+`mooncake_master` 只处理元数据（key→location 映射），不参与数据传输。
+
+**Step 2：LMCache 配置文件（YAML）**
+
+Decoder 侧（`mooncake-decoder-config.yaml`，Machine A）：
+
+```yaml
+chunk_size: 256               # 每个缓存块的 token 数（需与 vLLM block_size 对齐）
+remote_url: "mooncakestore://192.168.1.100:50052/"
+remote_serde: "naive"         # 序列化格式（raw bytes，无压缩）
+local_cpu: false              # 禁用本地 CPU DRAM 缓存层
+
+extra_config:
+  local_hostname: "192.168.1.100"           # 本机 IP（用于 RDMA 端点注册）
+  metadata_server: "http://192.168.1.100:8080/metadata"
+  protocol: "rdma"                          # 或 "tcp"（无 InfiniBand 时）
+  device_name: "mlx5_0"                    # RDMA 网卡名
+  master_server_address: "192.168.1.100:50052"
+  global_segment_size: 32212254720          # 本机贡献给全局池的内存（30 GiB）
+  local_buffer_size:   1073741824           # RDMA 传输缓冲区（1 GiB）
+```
+
+Prefiller 侧（`mooncake-prefiller-config.yaml`，Machine B）：结构完全相同，只需将 `local_hostname` 改为 Machine B 的 IP，`remote_url` 仍指向 Machine A 的 master。
+
+**Step 3：启动 vLLM（两台机器）**
+
+```bash
+# Machine A（Decoder）
+LMCACHE_CONFIG_FILE=mooncake-decoder-config.yaml \
+LMCACHE_USE_EXPERIMENTAL=True \
+VLLM_ENABLE_V1_MULTIPROCESSING=1 \
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_consumer"}' \
+  --port 8200
+
+# Machine B（Prefiller）
+LMCACHE_CONFIG_FILE=mooncake-prefiller-config.yaml \
+LMCACHE_USE_EXPERIMENTAL=True \
+VLLM_ENABLE_V1_MULTIPROCESSING=1 \
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_producer"}' \
+  --port 8100
+```
+
+**Step 4：代理服务器（注意事项）**
+
+使用 LMCache 提供的 `disagg_proxy_server.py`，但**必须注释掉 `wait_decode_kv_ready(req_id)` 调用**：
+
+```python
+# disagg_proxy_server.py
+async def handle_request(request):
+    # Step 1: 发送到 Prefiller（计算并写入 MooncakeStore）
+    await forward_to_prefiller(request)
+    # wait_decode_kv_ready(req_id)   # ← 使用 MooncakeStore 时必须注释掉！
+    #                                 # MooncakeStore 是解耦的：
+    #                                 # Decoder 自己轮询 store，不需要 proxy 通知
+
+    # Step 2: 发送到 Decoder（从 MooncakeStore 加载 KV，执行 Decode）
+    response = await forward_to_decoder(request)
+    return response
+```
+
+```bash
+python3 disagg_proxy_server.py \
+  --host localhost --port 9000 \
+  --prefiller-host 192.168.1.200 --prefiller-port 8100 \
+  --decoder-host   192.168.1.100 --decoder-port 8200
+```
+
+---
+
+#### 7.6.7 从零手搓：LMCache + MooncakeStore 全套实现
+
+理解原理后，可以从零搭建一个精简版，覆盖端到端完整流程。
+
+**Step 1：MooncakeStore Client 封装**
+
+```python
+# minimal/mooncake_client.py
+import os, json
+from mooncake.store import MooncakeDistributedStore
+
+class MinimalMooncakeClient:
+    """封装 MooncakeDistributedStore，提供简洁的 put/get/exists 接口"""
+
+    def __init__(self, config: dict):
+        self.store = MooncakeDistributedStore()
+        self.store.setup(
+            local_hostname=config["local_hostname"],
+            metadata_server=config["metadata_server"],
+            global_segment_size=config.get("global_segment_size", 32 * 1024**3),
+            local_buffer_size=config.get("local_buffer_size", 1 * 1024**3),
+            protocol=config.get("protocol", "rdma"),
+            rdma_devices=config.get("device_name", ""),
+            master_server_addr=config["master_server_address"],
+        )
+
+    def put(self, key: str, data: bytes) -> None:
+        self.store.put(key, data)
+
+    def get(self, key: str) -> bytes | None:
+        return self.store.get(key)
+
+    def exists(self, key: str) -> bool:
+        return self.store.is_exist(key) == 1
+
+    def close(self) -> None:
+        self.store.close()
+```
+
+**Step 2：ChunkedTokenDatabase —— 前缀感知查找**
+
+```python
+# minimal/chunked_token_db.py
+import hashlib, numpy as np
+
+class ChunkedTokenDatabase:
+    """
+    把 token 序列分成固定大小的 chunk，为每个 chunk 计算内容哈希。
+    相同前缀的请求会产生相同的 key，实现跨请求 KV 复用。
+    """
+
+    def __init__(self, chunk_size: int = 256):
+        self.chunk_size = chunk_size
+        self._key_cache: dict[int, str] = {}  # chunk_idx → key string
+
+    def get_keys(self, token_ids: list[int], prefix: str = "") -> list[str]:
+        """为 token_ids 的每个完整 chunk 生成存储 key"""
+        keys = []
+        for i in range(0, len(token_ids) - self.chunk_size + 1, self.chunk_size):
+            chunk = token_ids[i:i + self.chunk_size]
+            chunk_hash = hashlib.sha256(
+                np.array(chunk, dtype=np.int32).tobytes()
+            ).hexdigest()[:16]
+            key = f"{prefix}/{chunk_hash}"
+            keys.append(key)
+        return keys
+
+    def count_matched(self, token_ids: list[int], client: "MinimalMooncakeClient",
+                      prefix: str = "") -> int:
+        """返回从头开始连续命中的 chunk 数量"""
+        keys = self.get_keys(token_ids, prefix)
+        for i, key in enumerate(keys):
+            if not client.exists(key):
+                return i    # 前 i 个连续命中
+        return len(keys)    # 全部命中
+```
+
+**Step 3：Prefiller 侧连接器（save_kv_layer）**
+
+```python
+# minimal/prefill_connector.py
+import torch
+from .chunked_token_db import ChunkedTokenDatabase
+from .mooncake_client import MinimalMooncakeClient
+
+class MinimalPrefillConnector:
+    """
+    Prefiller 侧：逐层把 KV 写入 MooncakeStore。
+    对应 LMCacheConnectorV1 的 save_kv_layer + wait_for_save。
+    """
+
+    def __init__(self, client: MinimalMooncakeClient, chunk_size: int = 256):
+        self.client   = client
+        self.chunk_db = ChunkedTokenDatabase(chunk_size)
+        self.model_prefix = "mymodel"
+
+    def save_kv_layer(
+        self,
+        layer_idx: int,
+        kv_layer: torch.Tensor,   # shape: [2, num_tokens, num_heads, head_dim]
+        token_ids: list[int],
+    ) -> None:
+        """把当前层的 KV 数据写入 MooncakeStore（按 chunk 分割存储）"""
+        keys = self.chunk_db.get_keys(token_ids, prefix=self.model_prefix)
+        chunk_size = self.chunk_db.chunk_size
+
+        for chunk_idx, base_key in enumerate(keys):
+            # 提取该 chunk 对应的 KV 数据
+            start = chunk_idx * chunk_size
+            end   = start + chunk_size
+            kv_chunk = kv_layer[:, start:end, :, :]  # [2, chunk_size, heads, dim]
+
+            # 生成包含层信息的存储 key
+            layer_key = f"{base_key}/layer{layer_idx}"
+
+            # 序列化并写入（不阻塞）
+            kv_bytes = kv_chunk.cpu().numpy().tobytes()
+            self.client.put(layer_key, kv_bytes)
+
+    def wait_for_save(self) -> None:
+        """等待所有异步写入完成（简化版：put 是同步的，无需等待）"""
+        pass
+```
+
+**Step 4：Decoder 侧连接器（start_load_kv + wait_for_layer_load）**
+
+```python
+# minimal/decode_connector.py
+import threading, torch
+from .chunked_token_db import ChunkedTokenDatabase
+from .mooncake_client import MinimalMooncakeClient
+
+class MinimalDecodeConnector:
+    """
+    Decoder 侧：从 MooncakeStore 加载 KV，按层写入 paged KV buffer。
+    对应 LMCacheConnectorV1 的 start_load_kv + wait_for_layer_load。
+    """
+
+    def __init__(self, client: MinimalMooncakeClient,
+                 kv_caches: list[torch.Tensor], chunk_size: int = 256):
+        self.client    = client
+        self.kv_caches = kv_caches
+        self.chunk_db  = ChunkedTokenDatabase(chunk_size)
+        self.model_prefix = "mymodel"
+        # 每层一个 Event，等待该层加载完成
+        self._layer_events: dict[int, threading.Event] = {}
+
+    def get_num_matched_tokens(self, token_ids: list[int]) -> int:
+        """查询有多少 token 的 KV 已在 MooncakeStore 中（前缀连续命中）"""
+        matched_chunks = self.chunk_db.count_matched(
+            token_ids, self.client, prefix=self.model_prefix
+        )
+        return matched_chunks * self.chunk_db.chunk_size
+
+    def start_load_kv(self, token_ids: list[int], block_ids: list[int]) -> None:
+        """
+        异步触发从 MooncakeStore 加载 KV 到 vLLM paged KV buffer。
+        每层启动一个后台线程并行拉取。
+        """
+        keys = self.chunk_db.get_keys(token_ids, prefix=self.model_prefix)
+        num_layers = len(self.kv_caches)
+
+        for layer_idx in range(num_layers):
+            ev = threading.Event()
+            self._layer_events[layer_idx] = ev
+
+            def _load_layer(lidx=layer_idx, ev=ev):
+                kv_cache = self.kv_caches[lidx]
+                for chunk_idx, base_key in enumerate(keys):
+                    layer_key = f"{base_key}/layer{lidx}"
+                    kv_bytes  = self.client.get(layer_key)
+                    if kv_bytes is None:
+                        continue
+                    # 把数据写入 paged KV buffer 的对应 block
+                    block_id = block_ids[chunk_idx]
+                    kv_tensor = torch.frombuffer(kv_bytes, dtype=kv_cache.dtype)
+                    kv_tensor = kv_tensor.reshape(2, -1, *kv_cache.shape[2:])
+                    kv_cache[0, block_id] = kv_tensor[0]  # key
+                    kv_cache[1, block_id] = kv_tensor[1]  # value
+                ev.set()
+
+            threading.Thread(target=_load_layer, daemon=True).start()
+
+    def wait_for_layer_load(self, layer_idx: int) -> None:
+        """等待指定层的 KV 加载完成（在该层 Attention 执行前调用）"""
+        ev = self._layer_events.pop(layer_idx, None)
+        if ev:
+            ev.wait()
+```
+
+**Step 5：组装 vLLM V1 Connector（胶水层）**
+
+```python
+# minimal/lmcache_connector.py
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+
+class MinimalLMCacheConnector(KVConnectorBase_V1):
+    """
+    精简版 LMCacheConnectorV1，使用 MooncakeStore 作为后端。
+    """
+
+    def __init__(self, vllm_config, role):
+        super().__init__(vllm_config, role)
+        from .mooncake_client import MinimalMooncakeClient
+        cfg = json.load(open(os.environ["LMCACHE_CONFIG_FILE"]))
+        self.client = MinimalMooncakeClient(cfg.get("extra_config", {}))
+        self.chunk_db = ChunkedTokenDatabase(cfg.get("chunk_size", 256))
+        self.model_prefix = vllm_config.model_config.model.replace("/", "_")
+        self._load_events: dict[str, threading.Event] = {}
+
+    # ── Scheduler 侧 ─────────────────────────────────────────────
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        token_ids = request.inputs.prompt_token_ids
+        matched_chunks = self.chunk_db.count_matched(
+            token_ids, self.client, self.model_prefix
+        )
+        n = matched_chunks * self.chunk_db.chunk_size - num_computed_tokens
+        return max(n, 0), n > 0
+
+    def update_state_after_alloc(self, request, blocks, num_lookahead_slots):
+        pass  # LMCache 不需要在分配后更新状态
+
+    def build_connector_meta(self, request):
+        token_ids = request.inputs.prompt_token_ids
+        keys = self.chunk_db.get_keys(token_ids, self.model_prefix)
+        return {"keys": keys, "req_id": request.request_id,
+                "block_ids": request.get_block_ids()}
+
+    def request_finished(self, request, block_ids, success):
+        return False, None  # 不需要延迟释放
+
+    def take_events(self):
+        return []
+
+    # ── Worker 侧 ─────────────────────────────────────────────────
+    def register_kv_caches(self, kv_caches):
+        self.kv_caches = kv_caches
+
+    def start_load_kv(self, scheduler_output, finished_reqs):
+        meta = scheduler_output.connector_metadata
+        if not meta:
+            return
+        connector = MinimalDecodeConnector(
+            self.client, self.kv_caches, self.chunk_db.chunk_size
+        )
+        connector.start_load_kv(
+            token_ids=meta["keys"],  # simplified
+            block_ids=meta["block_ids"]
+        )
+        self._load_connector = connector
+
+    def wait_for_layer_load(self, layer_name):
+        layer_idx = int(layer_name.split(".")[-1])
+        if hasattr(self, "_load_connector"):
+            self._load_connector.wait_for_layer_load(layer_idx)
+
+    def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
+        # Prefiller 侧：异步写入 MooncakeStore
+        layer_idx = int(layer_name.split(".")[-1])
+        # 实际实现会从 attn_metadata 中获取 token_ids
+        pass
+
+    def wait_for_save(self):
+        pass  # 实际实现等待所有异步 put 完成
+
+    def get_finished(self, finished_req_ids):
+        return [], []
+```
+
+---
+
+#### 7.6.8 本节小结
+
+| 维度 | P2P MooncakeConnector（§7.3） | LMCache + MooncakeStore（本节） | vllm-ascend AscendStore（§7.7） |
+|------|------------------------------|--------------------------------|--------------------------------|
+| **定位** | 简单 PD 分离，低延迟直传 | 主流全局 KV 池（NVIDIA GPU） | Ascend NPU 全局 KV 池 |
+| **跨请求复用** | ❌ | ✅ | ✅ |
+| **中间层** | 无 | LMCache（LocalBuffer） | 无 |
+| **调度器查询** | 无（不感知前缀） | 进程内 ChunkedTokenDatabase | ZMQ intra-node |
+| **per-layer IO** | ❌（一次性传输） | ✅ save_kv_layer / wait_for_layer_load | ✅ LayerSending/RecvingThread |
+| **delay_free** | ✅ | ❌ | ❌ |
+| **多 Decoder 共享** | ❌ | ✅（XP:YD） | ✅ |
+| **配置方式** | `MOONCAKE_CONFIG_PATH` JSON | `LMCACHE_CONFIG_FILE` YAML | `MOONCAKE_CONFIG_PATH` JSON |
+| **适合场景** | 严格 1P:1D、超低延迟 | 通用 NVIDIA 集群、大规模 Prefix 复用 | 华为 Ascend 集群 |
+
+**推荐选择逻辑**：
+- 你用 NVIDIA GPU，需要跨请求前缀复用 → **LMCache + MooncakeStore**（本节）
+- 你用华为 Ascend NPU → **vllm-ascend AscendStore**（§7.7）
+- 极简部署，只需单次 P→D 传输，不关心 KV 持久化 → **P2P MooncakeConnector**（§7.3）
+
+---
+
+### 7.7 vllm-ascend AscendStore：真实全局 KV 池实现
 
 > 源码路径：`vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/`
 
 7.5 节的模拟实现揭示了全局 KV 池的设计原理。vllm-ascend 的 **AscendStore** 是真实生产中的全局 KV 池实现，是本章的核心方案。本节将逐层拆解其四层架构、关键数据结构、请求生命周期、传输线程精髓，以及 MooncakeDistributedStore 后端原理，最后提供完整的"从零手搓"七步实现骨架。
 
-#### 7.6.1 完整四层架构
+#### 7.7.1 完整四层架构
 
 AscendStore 由四层组件构成，每层职责清晰分离：
 
@@ -1973,7 +2670,7 @@ flowchart TD
 
 ---
 
-#### 7.6.2 关键数据结构
+#### 7.7.2 关键数据结构
 
 理解数据结构是读懂整个系统的前提。
 
@@ -2063,7 +2760,7 @@ class LoadSpec:
 
 ---
 
-#### 7.6.3 调度器侧生命周期
+#### 7.7.3 调度器侧生命周期
 
 调度器侧（Scheduler Process）通过 `KVPoolScheduler` 管理请求状态，通过 ZMQ 向同节点 Worker 查询全局池命中情况。
 
@@ -2173,7 +2870,7 @@ def build_connector_meta(self, request) -> AscendConnectorMetadata | None:
 
 ---
 
-#### 7.6.4 Worker 侧生命周期
+#### 7.7.4 Worker 侧生命周期
 
 Worker Process 接收 Scheduler 发来的 `AscendConnectorMetadata`，通过 `KVPoolWorker` 执行实际的 KV 加载和存储。
 
@@ -2292,7 +2989,7 @@ def wait_for_save(self, request, finished: bool) -> bool:
 
 ---
 
-#### 7.6.5 传输线程：GPU Event 同步与去重
+#### 7.7.5 传输线程：GPU Event 同步与去重
 
 传输线程是 AscendStore 中最精密的部分，解决两个核心问题：
 1. **正确性**：如何确保 KV 计算完成后再传输？→ GPU Event 同步
@@ -2425,7 +3122,7 @@ def _retrieve_layerwise(self, req_meta) -> Generator:
 
 ---
 
-#### 7.6.6 MooncakeDistributedStore 后端
+#### 7.7.6 MooncakeDistributedStore 后端
 
 `MooncakeBackend` 封装了底层 `MooncakeDistributedStore` 的复杂性，提供简洁的 `put/get/exists` 接口。
 
@@ -2540,7 +3237,7 @@ class MooncakeBackend(Backend):
 
 ---
 
-#### 7.6.7 从零手搓完整 AscendStore
+#### 7.7.7 从零手搓完整 AscendStore
 
 有了以上基础，可以按依赖顺序，从底层往上逐步构建一个完整的极简版 AscendStore。
 
@@ -2926,7 +3623,7 @@ class MinimalAscendStoreConnector(KVConnectorBase_V1):
 
 ---
 
-#### 7.6.8 端到端数据流：一次全局池跨节点命中
+#### 7.7.8 端到端数据流：一次全局池跨节点命中
 
 以下是完整的跨节点 KV 命中场景：Node 0 作为 Prefill 节点计算了系统提示词，Node 1 作为 Decode 节点发起新请求。
 
@@ -2977,7 +3674,7 @@ Node 1（Decode 节点）：新请求，命中全局池
 
 ---
 
-#### 7.6.9 本节小结
+#### 7.7.9 本节小结
 
 | 特性 | 模拟版（7.5） | 上游 MooncakeConnector | vllm-ascend AscendStore |
 |------|--------------|----------------------|------------------------|
