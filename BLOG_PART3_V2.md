@@ -1096,9 +1096,9 @@ class KVConnectorBase_V1(ABC):
 #### 13.3.3 Mooncake 实现（基于 RDMA 的高速传输）
 
 > **深度解析参见《博客第二部分》第 7 章**，其中覆盖了：
-> - **7.3.1**：上游 vLLM P-push（RDMA WRITE）
-> - **7.3.5**：vllm-ascend D-pull（RDMA READ）及异构 TP 支持
-> - **7.3.7**：逐层传输（Layerwise Connector）
+> - **7.6.1**：上游 vLLM P-push（RDMA WRITE）
+> - **7.6.5**：vllm-ascend D-pull（RDMA READ）及异构 TP 支持
+> - **7.6.7**：逐层传输（Layerwise Connector）
 > - **7.6**：LMCache + MooncakeStore 主流全局 KV 池方案（NVIDIA GPU）
 > - **7.7**：vllm-ascend AscendStore 分布式 KV 池（Ascend NPU）
 
@@ -1182,7 +1182,7 @@ def get_finished(self, finished_req_ids):
     return self.finished_sending_reqs.pop(), self.finished_recving_reqs.pop()
 ```
 
-> **注意**：V1 MooncakeConnector 中 `save_kv_layer()` 和 `wait_for_layer_load()` 均为 **No-op**，因为 Mooncake 是整批传输（Prefill 完成后触发，非逐层）。逐层传输由 vllm-ascend 的 LayerwiseConnector 实现（见《博客第二部分》7.3.7）。
+> **注意**：V1 MooncakeConnector 中 `save_kv_layer()` 和 `wait_for_layer_load()` 均为 **No-op**，因为 Mooncake 是整批传输（Prefill 完成后触发，非逐层）。逐层传输由 vllm-ascend 的 LayerwiseConnector 实现（见《博客第二部分》7.6.7）。
 
 ##### V1 LMCacheConnector：真正的全局 KV Pool
 
