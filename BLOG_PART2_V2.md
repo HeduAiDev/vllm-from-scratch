@@ -647,9 +647,9 @@ docker exec vllm python3 -m pytest /mnt/esfs/master_work/vllm-from-scratch/02_kv
   https://arxiv.org/abs/2311.18677
 - KV Cache 卸载：*InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management*, OSDI 2024
 
-### 7.2 背景：vLLM 生态与 KVConnector 接口演进
+### 7.2 全局 KV 池方案全景：分类、对比与选型
 
-在深入源码之前，我们先搭建认知框架：理解 vLLM 生态中的各个组件，以及 KV 跨节点传输接口经历了怎样的演进。
+本节回答四个问题，帮助读者在深入源码前建立完整的认知地图：**有哪些大类方案？各方案是什么？各有什么优缺点？应该选择哪个？**
 
 #### 7.2.1 vLLM 与 vllm-ascend 的关系
 
@@ -663,72 +663,168 @@ docker exec vllm python3 -m pytest /mnt/esfs/master_work/vllm-from-scratch/02_kv
 | **硬件目标** | NVIDIA A100/H100/H200 | 华为昇腾 Atlas 800T A2 等 NPU |
 | **特有功能** | MooncakeConnector、LMCacheConnector、NixlConnector | D-pull RDMA READ、异构TP、AscendStore、MLA 专项优化 |
 
-vllm-ascend **不是 vLLM 的 Fork**，而是通过 vLLM 的 `VLLM_PLUGINS` 机制在运行时**动态替换**特定组件（Attention 层、KVConnector 类型、调度器行为等）。部署时需同时安装两个包：
+vllm-ascend **不是 vLLM 的 Fork**，而是通过 `VLLM_PLUGINS` 机制在运行时动态替换特定组件。
 
-```bash
-pip install vllm          # 上游基础
-pip install vllm-ascend   # 华为昇腾扩展（作为 Plugin 注入到 vLLM 运行时）
-```
+> **本文约定**：提到"上游 vLLM"指 `vllm-project/vllm`；"vllm-ascend"指 `vllm_ascend/` 路径下的扩展实现。
 
-> **本文约定**：提到"上游 vLLM"指 `vllm-project/vllm` 的实现；"vllm-ascend"指 `vllm_ascend/` 路径下的扩展实现。两者在 KVConnector 的选择上都走 V1 接口，但传输策略不同。
+---
 
-#### 7.2.2 V0 方案：KV Lookup Buffer（已废弃）
+#### 7.2.2 两大技术路线：P2P 直传 vs 全局存储池
 
-vLLM 最初的 KV 跨节点传输接口称为 **V0**，使用两个同步阻塞方法：
-
-```python
-# V0 KVConnectorBase（已废弃，但仍见于部分旧文档/教程！）
-class KVConnectorBase:
-
-    def send_kv_caches_and_hidden_states(
-        self, model_executable, model_input, kv_caches, hidden_states
-    ) -> None:
-        """P-Node：Prefill 全部完成后，将 KV Cache 写入 KV Lookup Buffer"""
-        ...
-
-    def recv_kv_caches_and_hidden_states(
-        self, model_executable, model_input, kv_caches
-    ) -> tuple[Tensor, bool]:
-        """D-Node：从 KV Lookup Buffer 按 token_hash 取 KV，填入本地 blocks"""
-        # bypass_model=True → D-Node 跳过 Prefill 前向传播，直接 Decode Attention
-        return hidden_states, True
-```
-
-V0 的分层架构——KV 传输管道 + 键值查找层：
+跨节点 KV Cache 共享存在两种根本不同的架构路线：
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    V0 KV 传输架构                             │
-│                                                              │
-│  P-Node: send_kv_caches_and_hidden_states()                  │
-│    ↓                                                         │
-│  KV Lookup Buffer                                            │
-│    API: insert(token_hash, kv_data)  ← P-Node 按 hash 写入  │
-│         drop_select(token_hash)      ← D-Node 按 hash 读取  │
-│    作用：解决 P/D 处理顺序不一致（P 先完成存入，D 后到取出） │
-│    ↓                                                         │
-│  KV Pipe（底层 FIFO 张量管道）                                │
-│    API: send_tensor(tensor) / recv_tensor()                  │
-│                                                              │
-│  D-Node: recv_kv_caches_and_hidden_states()                  │
-│    返回 bypass_model=True → 跳过 Prefill 重计算               │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  路线一：P2P 直传（分布式点对点）                                  │
+│                                                                 │
+│    Prefiller ──[RDMA WRITE/READ]──→ Decoder                     │
+│                                                                 │
+│    • 无共享存储，无中心节点                                        │
+│    • 每个请求独立传输一次，不持久化                                 │
+│    • 不支持跨请求前缀复用（同一提示词被 100 个请求用，传 100 次）    │
+│    • 代表：上游 vLLM MooncakeConnector（P-push）                  │
+│             vllm-ascend MooncakeConnectorV1（D-pull）            │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  路线二：全局存储池（中心化 KV 池）                                │
+│                                                                 │
+│    Prefiller ──[RDMA PUT]──→ 分布式 KV 存储池                    │
+│                                    │                           │
+│                               etcd/元数据                       │
+│                                    │                           │
+│    Decoder ←──[RDMA GET]───────────┘                           │
+│                                                                 │
+│    • 有中心元数据服务（etcd），管理 key→location 映射              │
+│    • KV 持久化在 DRAM 池中，支持跨请求前缀复用                     │
+│    • 同一提示词写入一次，100 个请求全部命中读取                     │
+│    • 代表：LMCache + MooncakeStore（NVIDIA GPU）                  │
+│             vllm-ascend AscendStore（Ascend NPU）                │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**V0 的四个核心局限**，直接推动了 V1 的重新设计：
+**关键区分**：P2P 解决的是"PD 分离"问题（让 Prefill 和 Decode 在不同节点上运行），但**不是**全局前缀缓存。全局存储池才能实现"相同前缀只计算一次，所有 Decoder 共用"的目标。
 
-| 局限 | 具体表现 |
-|------|---------|
-| **整体传输** | `send_kv_caches_and_hidden_states` 在 Prefill 全部完成后才调用，D-Node 等待 = 完整 Prefill 时延 |
-| **调度器盲目** | 调度器对 KV 传输状态完全无感知，无法在分配 blocks 时计算"有多少 tokens 可从远端加载" |
-| **无块生命周期控制** | P-Node 无法延迟 blocks 释放，RDMA 传输期间 blocks 可能被 LRU 驱逐，导致传输数据损坏 |
-| **进程职责混乱** | P/D 共用单一基类，V1 多进程架构（调度器进程 + Worker 进程）要求接口必须拆分 |
+---
 
-> **为什么要了解废弃接口？** 部分旧版博客、论文复现代码、早期 vLLM PR 仍使用 `send_kv_caches_and_hidden_states` / `recv_kv_caches_and_hidden_states`。读者见到这些方法名时应立即识别：**这是 V0 历史实现，当前 V1 架构已完全不同**，不能混用。
+#### 7.2.3 现有方案全览
 
-#### 7.2.3 V1 方案：调度器/Worker 分离（当前架构）
+目前业界有 4 个可用方案，覆盖两种路线和两种硬件平台：
 
-V1 的核心改变是**将 KVConnector 一分为二**：
+| 方案 | 路线 | 平台 | 跨请求复用 | 共享持久存储 | 支持 XP:YD | 可验证运行 |
+|------|------|------|-----------|------------|-----------|----------|
+| **上游 vLLM MooncakeConnector** | P2P（P-push） | NVIDIA GPU | ❌ | ❌ | ❌ | ✅ |
+| **LMCache + MooncakeStore** | 全局存储池 | NVIDIA GPU | ✅ | ✅ DRAM+可选SSD | ✅ | ✅ |
+| **vllm-ascend MooncakeConnectorV1** | P2P（D-pull） | Ascend NPU | ❌ | ❌ | ❌ | ❌（需昇腾硬件） |
+| **vllm-ascend AscendStore** | 全局存储池 | Ascend NPU | ✅ | ✅ DRAM | ✅ | ❌（需昇腾硬件） |
+
+**架构对比（4方案 × 核心维度）：**
+
+| 维度 | MooncakeConnector | LMCache + MooncakeStore | Ascend MooncakeConnectorV1 | AscendStore |
+|------|------------------|------------------------|--------------------------|-------------|
+| 元数据服务 | 无（P2P） | mooncake_master + etcd | 无（P2P） | KVPoolScheduler（ZMQ） |
+| KV 索引 | `transfer_id`（请求级） | SHA-256 block_hash | `transfer_id`（请求级） | SHA-256 block_hash |
+| 传输方向 | P RDMA WRITE → D | D RDMA GET ← Store | D RDMA READ ← P | D RDMA GET ← Store |
+| 异构 TP | ❌ | 依赖 MooncakeStore | ✅（P_tp ≥ D_tp） | ✅ |
+| 逐层流水线 | ❌ | ✅（per-layer save/load） | ✅（LayerwiseConnector） | ✅ |
+| 冷缓存层 | ❌ | ✅（CPU DRAM / NVMe SSD） | ❌ | ✅（可插拔后端） |
+| delay_free | ✅（P 侧保持 blocks） | ❌ | ✅ | ❌ |
+
+---
+
+#### 7.2.4 各方案优缺点
+
+**方案一：上游 vLLM MooncakeConnector（P2P，NVIDIA）**
+
+```
+优点：
+  ✅ 部署最简单：无需额外服务，只需 RDMA 网络
+  ✅ 延迟最低：P→D 直传，无中间跳转
+  ✅ 已进入 vLLM 主线，文档完善，社区支持好
+  ✅ 不需要 DRAM 存储预算
+
+缺点：
+  ❌ 每次请求完整传输一次 KV，高并发下带宽压力大
+  ❌ 不支持跨请求前缀复用（最大的局限）
+  ❌ 强耦合 1P:1D，难以横向扩展为 XP:YD
+  ❌ P 完成 Prefill 才传输，无法与计算并行（实际上 save_kv_layer 支持逐层，但无持久化）
+
+适合场景：对话型应用，每次对话内容不同，前缀复用收益低；或仅需要基础 PD 分离降低 GPU 竞争。
+```
+
+**方案二：LMCache + MooncakeStore（全局池，NVIDIA）**
+
+```
+优点：
+  ✅ 真正的全局前缀缓存：同一系统提示词写一次，所有 Decoder 共用
+  ✅ XP:YD 灵活扩展（多 Prefiller 共享同一存储池）
+  ✅ P/D 时序解耦：Prefiller 写完即释放，Decoder 独立读取
+  ✅ 支持多级存储（GPU VRAM → CPU DRAM → NVMe SSD）
+  ✅ 可验证运行（NVIDIA GPU + InfiniBand 或 TCP 软 RDMA）
+  ✅ 生产验证：Kimi K2（128 H200）等大规模集群使用
+
+缺点：
+  ❌ 部署复杂：需要额外运行 mooncake_master + etcd
+  ❌ 存在额外 memcpy（LMCache LocalBuffer 中转）
+  ❌ 引入 LMCache 中间层，调试链路更长
+  ❌ DRAM 存储成本（需要预留 30~64 GiB/节点）
+
+适合场景：固定系统提示词场景（客服、RAG、代码助手），多P多D大规模集群，系统提示词频繁复用。
+```
+
+**方案三：vllm-ascend MooncakeConnectorV1（P2P，Ascend）**
+
+```
+优点：
+  ✅ 针对 Ascend NPU 优化（D-pull 方向，减少 P 侧 NPU 负担）
+  ✅ 支持异构 TP（P_tp=4, D_tp=2 等组合）
+  ✅ 逐层传输流水线（LayerwiseConnector）
+
+缺点：
+  ❌ 同样不支持跨请求前缀复用
+  ❌ 需要 Ascend NPU 硬件，无法在 NVIDIA GPU 上验证
+```
+
+**方案四：vllm-ascend AscendStore（全局池，Ascend）**
+
+```
+优点：
+  ✅ Ascend 上的真正全局 KV 池
+  ✅ SHA-256 内容寻址，跨节点去重
+  ✅ ZMQ intra-node 快速查询（无外部服务依赖）
+  ✅ 可插拔后端（MooncakeDistributedStore / Memcache）
+
+缺点：
+  ❌ 需要 Ascend NPU 硬件，无法在 NVIDIA GPU 上验证
+  ❌ 社区文档相对较少
+```
+
+---
+
+#### 7.2.5 业界推荐方案
+
+> **结论先行**：如果你用 NVIDIA GPU 且关注全局前缀缓存，**推荐使用 LMCache + MooncakeStore**。
+
+选择理由：
+1. **可验证性**：不需要昇腾硬件，任意 NVIDIA GPU 集群（含软 RDMA/TCP 回退）均可运行
+2. **真正的全局前缀缓存**：跨请求、跨 Prefiller 节点复用 KV
+3. **生产验证**：Kimi K2（128 H200，224K tokens/sec Prefill，288K tokens/sec Decode）等大规模部署
+4. **社区活跃**：LMCache 和 Mooncake 均有官方文档和持续维护
+
+**本章后续结构**：
+- §7.3 — MooncakeConnector P2P 深度解析（理解 P2P 基础，为全局池对比做铺垫）
+- §7.4 — RDMA 从零到懂（传输层基础知识）
+- §7.5 — 模拟全局 KV 池（从原理理解设计）
+- **§7.6 — LMCache + MooncakeStore 完整手撕（推荐方案，重点）**
+- §7.7 — vllm-ascend AscendStore（Ascend 参考实现）
+
+---
+
+#### 7.2.6 KVConnector V1 接口（实现基础）
+
+以上所有方案均基于 vLLM V1 的 `KVConnectorBase_V1` 接口。理解这个接口是读懂后续源码的前提。
+
+**V1 的核心设计**：将 Connector 一分为二——Scheduler 进程侧（感知调度）+ Worker 进程侧（执行传输）：
 
 ```
 V1 KVConnectorBase_V1
@@ -737,100 +833,51 @@ V1 KVConnectorBase_V1
 │   ├── get_num_new_matched_tokens(request, num_computed_tokens)
 │   │     → 返回 (extra_tokens, is_async)
 │   │     → 告知调度器：远端还有多少 token 的 KV 可加载
-│   │     → 调度器据此精确分配 KV blocks、计算 token budget
 │   │
 │   ├── update_state_after_alloc(request, blocks, num_external_tokens)
 │   │     → blocks 分配完成后，记录"哪些 blocks 需要从远端填充"
 │   │
 │   ├── build_connector_meta(scheduler_output) → KVConnectorMetadata
-│   │     → 打包本调度步的传输元数据，附带在 SchedulerOutput 上
-│   │     → 通过 ZeroMQ IPC 通道发给 Worker 进程
+│   │     → 打包本调度步的传输元数据，通过 ZeroMQ IPC 发给 Worker 进程
 │   │
 │   ├── request_finished(request, block_ids) → (bool, dict|None)
-│   │     → 请求完成时回调；delay_free=True 则 Connector 接管 blocks 释放时机
+│   │     → delay_free=True 则 Connector 接管 blocks 释放时机
 │   │     → P-Node 在此记录待发 blocks（RDMA WRITE 完成前绝不能释放！）
 │   │
 │   └── take_events() → Iterable[KVCacheEvent]
-│         → 向调度器汇报 KV Cache 可用状态变化（供全局 Prefix Cache 使用）
 │
 └── Worker 侧（GPU Worker 进程，在 execute_model 前后调用）
-    ├── register_kv_caches(kv_caches)
-    │     → 启动时一次性：将 GPU KV Cache 内存注册到 RDMA 引擎（"钉住"内存）
-    │
-    ├── start_load_kv(forward_context)
-    │     → 前向传播前：D-Node 发起异步 KV 加载；立即返回，不阻塞模型执行
-    │
-    ├── wait_for_layer_load(layer_name)
-    │     → 每层 attention 前：等待该层 KV 加载完成
-    │     → 支持逐层流水线：Layer N 传输时，Layer N+1 的 attention 先运行
-    │
-    ├── save_kv_layer(layer_name, kv_layer, attn_metadata)
-    │     → 每层 attention 后：异步发送/保存该层 KV（P-Node 使用）
-    │
-    ├── wait_for_save()
-    │     → 前向传播结束：等待所有层 KV 发送完成
-    │
-    └── get_finished(finished_req_ids) → (set|None, set|None)
-          → 轮询异步完成状态
-          → P-Node: 返回 finished_sending → 调度器知道哪些 blocks 可释放
-          → D-Node: 返回 finished_recving → 调度器知道哪些请求可进 Decode
-```
-
-调度器进程与 Worker 进程通过 `KVConnectorMetadata`（附带在 `SchedulerOutput` 上）进行 IPC 通信：
-
-```
-Scheduler 进程                        Worker 进程
-─────────────────────────────         ──────────────────────────
-schedule() {                          execute_model() {
-  connector.get_num_new_matched_tokens  ← 请求到达时
-  connector.update_state_after_alloc    ← blocks 分配后
-  connector.build_connector_meta()          → KVConnectorMetadata
-                                      ← (ZeroMQ IPC 序列化传输)
-}                                         bind_connector_metadata()
-                                          start_load_kv()         ← 前向传播前
-                                          ...attention layers...
-                                          wait_for_save()         ← 前向传播后
-                                          get_finished()
-                                      }
+    ├── register_kv_caches(kv_caches)   → 将 GPU KV Cache 内存注册到 RDMA 引擎
+    ├── start_load_kv(forward_context)  → D-Node 发起异步 KV 加载
+    ├── wait_for_layer_load(layer_name) → 等待该层 KV 加载完成（逐层流水线）
+    ├── save_kv_layer(layer_name, ...)  → 异步保存/发送该层 KV（P-Node）
+    ├── wait_for_save()                 → 等待所有层 KV 发送完成
+    └── get_finished(finished_req_ids)  → 轮询异步完成状态
 ```
 
 完整接口定义详见《博客第三部分》§13.3.2。
 
-#### 7.2.4 vllm-ascend 方案一览
+> **V0 历史背景**（简短说明，避免代码阅读时困惑）：vLLM 早期使用 `send_kv_caches_and_hidden_states` / `recv_kv_caches_and_hidden_states` 的 V0 接口，已在 vLLM V1 中废弃。部分旧博客、PR 和论文复现代码仍使用这些方法名，遇到时识别为**历史实现**即可，当前 V1 架构已完全重新设计。
 
-在 V1 接口框架下，vllm-ascend 实现了两类 KV 传输机制：
+---
 
-**A. 点对点传输（kv_p2p）**：直接替换上游 MooncakeConnector
-- 传输方向：**D-pull（RDMA READ）**，与上游 P-push 相反——D 主动从 P 读取
-- 支持异构 TP（P_tp > D_tp，如 P_tp=4、D_tp=2 的组合）
-- 支持 LayerwiseConnector（逐层传输流水线，Prefill 每完成一层立即 RDMA）
-- 源码：`vllm_ascend/distributed/kv_transfer/kv_p2p/`
+#### 7.2.7 全局 KV 池的理想架构图
 
-**B. 全局 KV 池（AscendStore）**：真正的全局前缀缓存
-- 有中心元数据服务（KVPoolScheduler，ZMQ RPC）
-- 按 block_hash（SHA-256）索引，支持跨 P 节点前缀复用
-- 可插拔后端（MooncakeDistributedStore / Memcache）
-- 源码：`vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/`
-
-详细实现见 §7.3.5（D-pull）、§7.3.6（异构TP）、§7.3.7（逐层传输）、§7.6（LMCache+MooncakeStore）、§7.7（AscendStore）。
-
-#### 7.2.5 全局 KV 池的理想架构
-
-有了以上背景，我们可以理解"全局 KV 池"的理想目标。下图展示**全局池化架构**（LMCache / AscendStore 等方案对应此设计，上游 vLLM MooncakeConnector 是 P2P 方案，没有中心元数据服务器）：
+全局存储池方案（LMCache + MooncakeStore / AscendStore）对应以下理想架构：
 
 ```mermaid
 flowchart TD
-    MS["全局 Metadata Server<br/>etcd/Redis<br/>block_hash → node_id, memory_addr, size, access_time<br/>API: publish() / query() / invalidate()"]
+    MS["全局 Metadata Server<br/>etcd / mooncake_master<br/>block_hash → node_id, memory_addr, size<br/>API: put_start / put_end / get_replica_list"]
 
     MS -->|"元数据查询（μs 级）"| PW
     MS -->|"元数据查询（μs 级）"| DW
 
     subgraph PW["Prefill 节点（Node 0,1,...)"]
-        P1["① 计算 KV Cache<br/>② 发布到全局池<br/>GPU VRAM: 80GB<br/>CPU DRAM: 512GB"]
+        P1["① 计算 KV Cache<br/>② RDMA PUT → 全局池<br/>GPU VRAM: 80GB<br/>CPU DRAM: 512GB"]
     end
 
     subgraph DW["Decode 节点（Node 4,5,...)"]
-        D1["① 查询 Metadata Server<br/>② 发起 RDMA 拉取<br/>③ 直接开始 Decode<br/>GPU VRAM: 80GB"]
+        D1["① 查询 Metadata Server<br/>② RDMA GET ← 全局池<br/>③ 直接开始 Decode<br/>GPU VRAM: 80GB"]
     end
 
     PW -->|"RDMA<br/>100-400 Gbps<br/>延迟 2-5μs"| DW
@@ -842,16 +889,7 @@ flowchart TD
     style STORE fill:#f8d7da,stroke:#721c24
 ```
 
-**三类实现方案对比**（从简单到完整）：
-
-| | 上游 vLLM MooncakeConnector | LMCache V1 | vllm-ascend AscendStore |
-|--|------------------------------|------------|--------------------------|
-| 中心元数据服务 | ❌（P2P，无中心服务） | ❌（本地引擎） | ✅ KVPoolScheduler（ZMQ RPC） |
-| KV 索引方式 | `transfer_id`（请求级配对） | `block_hash`（内容寻址） | `SHA-256(token_ids)` |
-| 跨 P 节点复用 | ❌（固定 P→D 配对） | ✅ | ✅ |
-| 传输方向 | P RDMA WRITE → D | D 从 LMCache 存储层读取 | D 从后端（Mooncake/Memcache）拉取 |
-| 冷缓存层 | ❌ | ✅ CPU/NVMe 分层 | ✅ 可插拔后端 |
-| 适合场景 | 低延迟 P→D 精确配对 | 大容量 Prefix Pool，多P共享 | 华为 Ascend 集群全局缓存 |
+详细实现见 §7.3.5（D-pull）、§7.3.6（异构TP）、§7.3.7（逐层传输）、§7.6（LMCache+MooncakeStore）、§7.7（AscendStore）。
 
 ### 7.3 Mooncake 真实源码深度解析
 
