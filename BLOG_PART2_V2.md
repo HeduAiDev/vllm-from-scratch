@@ -992,15 +992,9 @@ flowchart TD
 
 ### 7.3 Mooncake 真实源码深度解析
 
-上游 vLLM 和 vllm-ascend 在传输方向上有根本性的差异，两者都值得深入了解：
-
-| | 上游 vLLM | vllm-ascend |
-|--|-----------|-------------|
-| **源码路径** | `vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py` | `vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py` |
-| **传输方向** | P push（RDMA WRITE） | D pull（RDMA READ） |
-| **异构 TP** | ❌ NotImplementedError | ✅ P_tp ≥ D_tp，P_tp % D_tp == 0 |
-| **逐层传输** | ❌ | ✅ LayerwiseConnector |
-| **全局 KV 池** | ❌（仅 P2P） | ✅ AscendStore（见 7.7） |
+> **本节定位**：§7.2 已给出选型结论（推荐 LMCache + MooncakeStore 或 Ascend 对应的全局池方案）。本节深入 **P2P 路线**的真实源码，目的有二：其一，P2P 是全局池方案的传输内核——理解它才能看懂 §7.6/7.7 在其之上叠加了什么；其二，上游 vLLM（P-push）与 vllm-ascend（D-pull）传输方向相反，这个差异在源码和行业文章中反复出现，值得专门辨析。
+>
+> **本节只讲 P2P MooncakeConnector**，不涉及全局存储池；全局池实现见 §7.6（LMCache + MooncakeStore）、§7.7（AscendStoreConnector）、§7.8（MooncakeConnectorStoreV1）。
 
 #### 7.3.1 上游 vLLM：P 主动推送（RDMA WRITE）
 
@@ -1459,14 +1453,16 @@ get_finished() → (finished_sending, None)  get_finished() → (None, finished_
 
 #### 7.3.5 三种实现对比（模拟 / 上游 vLLM / vllm-ascend）
 
-| 特性 | 模拟实现（global_kv_pool.py） | 真实 Mooncake 实现 |
-|------|------------------------------|-------------------|
-| 元数据服务 | Python dict（单进程内） | 分布式（每个 engine 独立维护） |
+> **注**："模拟实现"列对应 §7.5 中的 `global_kv_pool.py`，完整代码在该节展开。此处可先聚焦右侧两列的真实实现差异，读完 §7.5 后再回看左列，对照会更清晰。
+
+| 特性 | 模拟实现（§7.5） | 上游 vLLM MooncakeConnector | vllm-ascend MooncakeConnectorV1 |
+|------|-----------------|-----------------------------|---------------------------------|
+| 元数据服务 | Python dict（单进程内） | 分布式（每个 engine 独立维护） | 分布式（每个 engine 独立维护） |
 | 传输方向 | submit_transfer（D pull） | RDMA WRITE（P push） | RDMA READ（D pull） |
 | 传输协议 | Python threading sleep | mooncake.engine（RDMA） | mooncake.engine（RDMA） |
 | P/D 发现 | 预置 node_id | Bootstrap Server（HTTP） | ZMQ handshake |
 | P/D 协调 | wait_for_kv() 同步等 | asyncio.Event + ZMQ | 异步接收线程 |
-| 块地址 | 抽象 block_hash | GPU 物理内存指针 | GPU NPU 内存指针 |
+| 块地址 | 抽象 block_hash | GPU 物理内存指针 | NPU 内存指针 |
 | 块合并 | 无 | group_concurrent_contiguous() | 连续块合并 |
 | 异构 TP | ❌ | ❌ | ✅ block 分割 |
 | 逐层传输 | ❌ | ❌ | ✅ |
@@ -1610,6 +1606,10 @@ def retrieve_layer(self, request) -> Generator:
 ```
 
 ### 7.4 RDMA 从零到懂——完整技术指南
+
+> **本节定位**：§7.3 的源码反复出现 `batch_register_memory`、`RDMA WRITE/READ`、`QP`、`GPUDirect` 等词，但没有解释底层原理。**五种 KV 传输方案的物理层都是 RDMA**，读懂它才能理解 §7.6/7.7/7.8 中的性能数字（为什么跨节点延迟是 2–5μs？为什么 `register_buffer=true` 能省去 100ms？）。
+>
+> **没有 RDMA 硬件也可以继续**：§7.4.1 提供 SoftRoCE 软件模拟安装方法；§7.5 的全局池模拟也完全不依赖真实 NIC，可以直接运行验证概念。
 
 #### 7.4.1 RDMA 是什么？硬件要求
 
@@ -1944,6 +1944,10 @@ MISS            │ (更快)    │  (唯一选择) │
 
 ### 7.5 从零实现：模拟多节点全局 KV 池
 
+> **本节定位**：§7.3 建立了 P2P 传输认知，§7.4 补齐了 RDMA 物理层原理。有了这两块基础，直接跳入 §7.6 的 LMCache 真实代码仍有跳跃感——真实代码混入了多级存储、etcd、LRU 淘汰等工程细节，很难一眼看清"全局 KV 池的核心设计逻辑"。
+>
+> 本节用纯 Python 剥离所有工程复杂度，只保留三个核心决策：**block_hash 链式前缀匹配**、**GlobalMetadataServer 管理 KV 位置**、**异步传输等待（WAITING_FOR_REMOTE_KVS）接入调度器**。读完本节，§7.6 的 LMCache 就是把这三件事换成真实 RDMA 和多级存储的工程化版本。
+>
 > 完整代码：`06_global_prefix_cache/global_kv_pool.py`
 
 #### 7.5.1 架构设计
