@@ -841,15 +841,15 @@ vllm-ascend **不是 vLLM 的 Fork**，而是通过 `VLLM_PLUGINS` 机制在运�
 ```mermaid
 flowchart TD
     subgraph CLUSTER["集群：所有节点 kv_role = kv_both（对等，无角色区分）"]
-        N0["Node-0\nvLLM Prefill + Decode\nMooncakeConnectorStoreV1"]
-        N1["Node-1\nvLLM Prefill + Decode\nMooncakeConnectorStoreV1"]
-        N2["Node-2\nvLLM Prefill + Decode\nMooncakeConnectorStoreV1"]
+        N0["Node-0<br/>vLLM Prefill + Decode<br/>MooncakeConnectorStoreV1"]
+        N1["Node-1<br/>vLLM Prefill + Decode<br/>MooncakeConnectorStoreV1"]
+        N2["Node-2<br/>vLLM Prefill + Decode<br/>MooncakeConnectorStoreV1"]
     end
-    STORE["MooncakeDistributedStore\nDRAM 全局池（100GB/节点）\n直连，无 LMCache 中间层"]
-    MASTER["mooncake_master\n段注册 & 淘汰管理\n（不参与数据传输）"]
-    N0 <-->|"RDMA PUT/GET\nP2PHANDSHAKE"| STORE
-    N1 <-->|"RDMA PUT/GET\nP2PHANDSHAKE"| STORE
-    N2 <-->|"RDMA PUT/GET\nP2PHANDSHAKE"| STORE
+    STORE["MooncakeDistributedStore<br/>DRAM 全局池（100GB/节点）<br/>直连，无 LMCache 中间层"]
+    MASTER["mooncake_master<br/>段注册 & 淘汰管理<br/>（不参与数据传输）"]
+    N0 <-->|"RDMA PUT/GET<br/>P2PHANDSHAKE"| STORE
+    N1 <-->|"RDMA PUT/GET<br/>P2PHANDSHAKE"| STORE
+    N2 <-->|"RDMA PUT/GET<br/>P2PHANDSHAKE"| STORE
     N0 & N1 & N2 -->|"注册 DRAM 段"| MASTER
     style STORE fill:#d4edda,stroke:#155724
     style MASTER fill:#cce5ff,stroke:#004085
@@ -863,18 +863,18 @@ flowchart TD
     subgraph PF["Prefill 节点（kv_producer）"]
         direction TB
         MC["MultiConnector（可选）"]
-        MCV1["MooncakeConnectorV1\nP2P 即时直传（低延迟）"]
-        ASC_P["AscendStoreConnector\n异步写入全局池"]
+        MCV1["MooncakeConnectorV1<br/>P2P 即时直传（低延迟）"]
+        ASC_P["AscendStoreConnector<br/>异步写入全局池"]
         MC --> MCV1
         MC --> ASC_P
     end
     subgraph DC["Decode 节点（kv_consumer）"]
         direction TB
-        ZMQ["KVPoolScheduler\nZMQ intra-node\nblock_hash 查询"]
+        ZMQ["KVPoolScheduler<br/>ZMQ intra-node<br/>block_hash 查询"]
         WK["Worker NPU"]
         ZMQ --> WK
     end
-    STORE["MooncakeDistributedStore\nDRAM 全局池"]
+    STORE["MooncakeDistributedStore<br/>DRAM 全局池"]
     MCV1 -->|"P2P RDMA（当前请求，当轮即用）"| WK
     ASC_P -->|"RDMA PUT（写入池，供后续复用）"| STORE
     STORE -->|"RDMA GET（命中时读取）"| WK
@@ -2755,37 +2755,37 @@ AscendStore 由四层组件构成，每层职责清晰分离：
 ```mermaid
 flowchart TD
     subgraph Conn["连接层（KVConnectorBase_V1 接口）"]
-        ASSC["AscendStoreConnector\nscheduler-side"]
-        ASCW["AscendStoreConnector\nworker-side"]
+        ASSC["AscendStoreConnector<br/>scheduler-side"]
+        ASCW["AscendStoreConnector<br/>worker-side"]
     end
 
     subgraph Sched["调度层（Scheduler Process）"]
-        PS["KVPoolScheduler\n_request_trackers / load_specs"]
-        LC["LookupKeyClient\nZMQ REQ socket"]
+        PS["KVPoolScheduler<br/>_request_trackers / load_specs"]
+        LC["LookupKeyClient<br/>ZMQ REQ socket"]
         PS --> LC
     end
 
     subgraph Work["Worker 层（Worker Process）"]
-        PW["KVPoolWorker\nregister / start_load / wait_for_save"]
-        LS["LookupKeyServer\nZMQ REP socket"]
-        ST["KVCacheStoreSendingThread\nPUT + GPU event + dedup"]
-        RT["KVCacheStoreRecvingThread\nGET + blocking"]
+        PW["KVPoolWorker<br/>register / start_load / wait_for_save"]
+        LS["LookupKeyServer<br/>ZMQ REP socket"]
+        ST["KVCacheStoreSendingThread<br/>PUT + GPU event + dedup"]
+        RT["KVCacheStoreRecvingThread<br/>GET + blocking"]
         PW --> LS
         PW --> ST
         PW --> RT
     end
 
     subgraph Back["后端存储层"]
-        MB["MooncakeBackend\nbatch_put / batch_get / batch_is_exist"]
-        MDS["MooncakeDistributedStore\n分布式 RDMA 存储"]
-        MEM["MemcacheBackend\n内存缓存，测试用"]
+        MB["MooncakeBackend<br/>batch_put / batch_get / batch_is_exist"]
+        MDS["MooncakeDistributedStore<br/>分布式 RDMA 存储"]
+        MEM["MemcacheBackend<br/>内存缓存，测试用"]
         MB --> MDS
         MB -.->|备选| MEM
     end
 
     ASSC --> PS
     ASCW --> PW
-    LC <-->|"intra-node ZMQ REQ/REP\n（同节点 Scheduler↔Worker IPC）"| LS
+    LC <-->|"intra-node ZMQ REQ/REP<br/>（同节点 Scheduler↔Worker IPC）"| LS
     ST <-->|"RDMA batch_put"| MB
     RT <-->|"RDMA batch_get"| MB
 ```
@@ -3855,17 +3855,17 @@ flowchart TD
     subgraph CLUSTER["集群（每个节点角色：kv_both）"]
         direction LR
         subgraph N0["Node-0  Atlas 800T A2 × 4"]
-            V0["vLLM\nMooncakeConnectorStoreV1\nTP=4，kv_both"]
+            V0["vLLM<br/>MooncakeConnectorStoreV1<br/>TP=4，kv_both"]
         end
         subgraph N1["Node-1  Atlas 800T A2 × 4"]
-            V1["vLLM\nMooncakeConnectorStoreV1\nTP=4，kv_both"]
+            V1["vLLM<br/>MooncakeConnectorStoreV1<br/>TP=4，kv_both"]
         end
     end
-    MASTER["mooncake_master :50088\n段注册 & 淘汰管理\n（eviction 95%/5%）\n不参与数据传输"]
-    STORE["MooncakeDistributedStore\nDRAM 全局池 100GB/节点\nRoCE RDMA 直连\nP2PHANDSHAKE 元数据"]
+    MASTER["mooncake_master :50088<br/>段注册 & 淘汰管理<br/>（eviction 95%/5%）<br/>不参与数据传输"]
+    STORE["MooncakeDistributedStore<br/>DRAM 全局池 100GB/节点<br/>RoCE RDMA 直连<br/>P2PHANDSHAKE 元数据"]
     V0 <-->|"RDMA PUT/GET"| STORE
     V1 <-->|"RDMA PUT/GET"| STORE
-    V0 & V1 -->|"注册 DRAM 段\nmaster_server_address"| MASTER
+    V0 & V1 -->|"注册 DRAM 段<br/>master_server_address"| MASTER
     style MASTER fill:#cce5ff,stroke:#004085
     style STORE fill:#d4edda,stroke:#155724
     style N0 fill:#fff3cd,stroke:#856404
@@ -4047,13 +4047,13 @@ sequenceDiagram
 flowchart LR
     subgraph NVIDIA["NVIDIA 路线（§7.6）"]
         direction TB
-        A1["vLLM\nLMCacheConnectorV1"] --> A2["LMCache Engine\n多级存储 / 淘汰策略\nLRU / LFU 可配置"]
-        A2 --> A3["MooncakeStoreConnector\n(RemoteConnector 接口)"]
-        A3 --> A4["MooncakeDistributedStore\nRDMA DRAM 池"]
+        A1["vLLM<br/>LMCacheConnectorV1"] --> A2["LMCache Engine<br/>多级存储 / 淘汰策略<br/>LRU / LFU 可配置"]
+        A2 --> A3["MooncakeStoreConnector<br/>(RemoteConnector 接口)"]
+        A3 --> A4["MooncakeDistributedStore<br/>RDMA DRAM 池"]
     end
     subgraph ASCEND["Ascend 路线（§7.8）"]
         direction TB
-        B1["vLLM\nMooncakeConnectorStoreV1"] --> B2["MooncakeDistributedStore\nRDMA DRAM 池"]
+        B1["vLLM<br/>MooncakeConnectorStoreV1"] --> B2["MooncakeDistributedStore<br/>RDMA DRAM 池"]
     end
     style NVIDIA fill:#e8f4f8,stroke:#0066cc
     style ASCEND fill:#f0f8e8,stroke:#006600
