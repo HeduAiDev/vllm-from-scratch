@@ -836,44 +836,51 @@ vllm-ascend **不是 vLLM 的 Fork**，而是通过 `VLLM_PLUGINS` 机制在运�
 
 这是本节最值得深入的对比。两者都是 Ascend 上的全局 KV 池，底层同样依赖 MooncakeDistributedStore 做 RDMA 传输，**但在架构理念上截然不同**：
 
-```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│              MooncakeConnectorStoreV1（"简洁路线"）                                 │
-│                                                                                    │
-│  所有节点 Node-0, Node-1, Node-2, ...                                              │
-│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐                          │
-│  │ kv_role=     │   │ kv_role=     │   │ kv_role=     │                          │
-│  │  kv_both     │   │  kv_both     │   │  kv_both     │                          │
-│  │              │   │              │   │              │                          │
-│  │ [Prefill]    │   │ [Decode]     │   │ [Prefill]    │                          │
-│  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘                          │
-│         │                  │                  │                                   │
-│         └──────────────────┴──────────────────┘                                   │
-│                    MooncakeDistributedStore（DRAM 全局池）                         │
-│                    P2PHANDSHAKE（无中心元数据服务）                                 │
-│                                                                                    │
-│  特点：对称架构，配置简单，不分 P/D 角色，全员平等                                  │
-└────────────────────────────────────────────────────────────────────────────────────┘
+**MooncakeConnectorStoreV1："简洁路线"——对称 colocated，直连 MooncakeStore**
 
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│              AscendStoreConnector（"灵活路线"，支持 MultiConnector）                 │
-│                                                                                    │
-│  Prefill 节点               Decode 节点                                            │
-│  ┌──────────────┐           ┌──────────────┐                                      │
-│  │ kv_role=     │  RDMA     │ kv_role=     │                                      │
-│  │  kv_producer │ ────────► │  kv_consumer │                                      │
-│  │              │  PUT      │              │                                      │
-│  │ MultiConnector（可选）    │                                                     │
-│  │  ├─ MooncakeConnectorV1  │  ← 当前请求即时 P2P 直传（低延迟）                   │
-│  │  └─ AscendStoreConnector │  → 同时写入全局池（未来请求复用）                     │
-│  └──────────────┘           └──────┬───────┘                                      │
-│                                    │ ZMQ 查询 KVPoolScheduler                     │
-│                            KVPoolServer（Worker 进程）                             │
-│                                    │ SHA-256 block_hash 查询                      │
-│                    MooncakeDistributedStore（DRAM 全局池）                         │
-│                                                                                    │
-│  特点：灵活角色分配，MultiConnector 兼顾延迟与复用，MLA 支持                        │
-└────────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph CLUSTER["集群：所有节点 kv_role = kv_both（对等，无角色区分）"]
+        N0["Node-0\nvLLM Prefill + Decode\nMooncakeConnectorStoreV1"]
+        N1["Node-1\nvLLM Prefill + Decode\nMooncakeConnectorStoreV1"]
+        N2["Node-2\nvLLM Prefill + Decode\nMooncakeConnectorStoreV1"]
+    end
+    STORE["MooncakeDistributedStore\nDRAM 全局池（100GB/节点）\n直连，无 LMCache 中间层"]
+    MASTER["mooncake_master\n段注册 & 淘汰管理\n（不参与数据传输）"]
+    N0 <-->|"RDMA PUT/GET\nP2PHANDSHAKE"| STORE
+    N1 <-->|"RDMA PUT/GET\nP2PHANDSHAKE"| STORE
+    N2 <-->|"RDMA PUT/GET\nP2PHANDSHAKE"| STORE
+    N0 & N1 & N2 -->|"注册 DRAM 段"| MASTER
+    style STORE fill:#d4edda,stroke:#155724
+    style MASTER fill:#cce5ff,stroke:#004085
+    style CLUSTER fill:#fff8e1,stroke:#f57f17
+```
+
+**AscendStoreConnector："灵活路线"——PD 分离 + MultiConnector，功能最全**
+
+```mermaid
+flowchart TD
+    subgraph PF["Prefill 节点（kv_producer）"]
+        direction TB
+        MC["MultiConnector（可选）"]
+        MCV1["MooncakeConnectorV1\nP2P 即时直传（低延迟）"]
+        ASC_P["AscendStoreConnector\n异步写入全局池"]
+        MC --> MCV1
+        MC --> ASC_P
+    end
+    subgraph DC["Decode 节点（kv_consumer）"]
+        direction TB
+        ZMQ["KVPoolScheduler\nZMQ intra-node\nblock_hash 查询"]
+        WK["Worker NPU"]
+        ZMQ --> WK
+    end
+    STORE["MooncakeDistributedStore\nDRAM 全局池"]
+    MCV1 -->|"P2P RDMA（当前请求，当轮即用）"| WK
+    ASC_P -->|"RDMA PUT（写入池，供后续复用）"| STORE
+    STORE -->|"RDMA GET（命中时读取）"| WK
+    style PF fill:#d4edda,stroke:#155724
+    style DC fill:#fff3cd,stroke:#856404
+    style STORE fill:#cce5ff,stroke:#004085
 ```
 
 **选型决策表：**
@@ -3821,6 +3828,427 @@ Node 1（Decode 节点）：新请求，命中全局池
 
 ---
 
+### 7.8 vllm-ascend MooncakeConnectorStoreV1：Ascend 全局 KV 池的简洁路线
+
+> **本节定位**：Ascend 全局 KV 池的另一条路线——直接对接 MooncakeDistributedStore，无 LMCache 中间层，无 ZMQ 自定义代码，部署极简，适合 PD colocated 场景快速上手。
+
+§7.7 介绍了功能最完整的 `AscendStoreConnector`：ZMQ intra-node 查询、MultiConnector、MLA 支持……但复杂度也随之增加。`MooncakeConnectorStoreV1` 走的是另一条路：**只做最必要的事**——将 vLLM KVConnector V1 接口直接绑定到 MooncakeDistributedStore，用最少的适配代码实现全局 KV 池。
+
+与 §7.6 的 LMCache + MooncakeStore 对比，可以看出它的设计理念：
+
+```
+LMCache 路线（NVIDIA，§7.6）：
+  vLLM → LMCacheConnectorV1 → LMCache Engine → MooncakeStoreConnector → MooncakeDistributedStore
+
+MooncakeConnectorStoreV1（Ascend，§7.8）：
+  vLLM → MooncakeConnectorStoreV1 → MooncakeDistributedStore
+```
+
+去掉了 LMCache 这一层：调用链更短、问题更易定位，代价是失去了 LMCache 的多级存储（SSD 冷缓存）和更丰富的淘汰策略。
+
+---
+
+#### 7.8.1 整体架构
+
+```mermaid
+flowchart TD
+    subgraph CLUSTER["集群（每个节点角色：kv_both）"]
+        direction LR
+        subgraph N0["Node-0  Atlas 800T A2 × 4"]
+            V0["vLLM\nMooncakeConnectorStoreV1\nTP=4，kv_both"]
+        end
+        subgraph N1["Node-1  Atlas 800T A2 × 4"]
+            V1["vLLM\nMooncakeConnectorStoreV1\nTP=4，kv_both"]
+        end
+    end
+    MASTER["mooncake_master :50088\n段注册 & 淘汰管理\n（eviction 95%/5%）\n不参与数据传输"]
+    STORE["MooncakeDistributedStore\nDRAM 全局池 100GB/节点\nRoCE RDMA 直连\nP2PHANDSHAKE 元数据"]
+    V0 <-->|"RDMA PUT/GET"| STORE
+    V1 <-->|"RDMA PUT/GET"| STORE
+    V0 & V1 -->|"注册 DRAM 段\nmaster_server_address"| MASTER
+    style MASTER fill:#cce5ff,stroke:#004085
+    style STORE fill:#d4edda,stroke:#155724
+    style N0 fill:#fff3cd,stroke:#856404
+    style N1 fill:#fff3cd,stroke:#856404
+```
+
+**架构要点：**
+
+1. **全节点对等**（`kv_both`）：每个节点同时担任 Prefiller 和 Decoder，调度器自主决定当前请求执行 Prefill 还是 Decode
+2. **mooncake_master**：只负责 DRAM 段的注册、定位和淘汰管理，**不参与实际数据传输**
+3. **MooncakeDistributedStore**：所有节点共享的 DRAM KV 池，节点间通过 P2P RDMA 直接读写
+4. **P2PHANDSHAKE**：KV 块元数据通过对等握手传递，无中心 etcd 服务
+
+---
+
+#### 7.8.2 完整部署配置（逐步操作）
+
+##### 步骤 1：启动 mooncake_master
+
+在集群中选一个节点（或独立服务器）运行元数据服务：
+
+```bash
+mooncake_master --port 50088 \
+  --eviction_high_watermark_ratio 0.95 \
+  --eviction_ratio 0.05
+```
+
+| 参数 | 含义 |
+|------|------|
+| `--port 50088` | mooncake_master 监听端口，需全集群可达 |
+| `--eviction_high_watermark_ratio 0.95` | DRAM 池使用率达 95% 时触发淘汰 |
+| `--eviction_ratio 0.05` | 每次淘汰释放 5% 空间，防止频繁抖动 |
+
+##### 步骤 2：编写 mooncake.json
+
+```json
+{
+    "metadata_server": "P2PHANDSHAKE",
+    "protocol": "ascend",
+    "device_name": "",
+    "use_ascend_direct": true,
+    "master_server_address": "<your_master_ip>:50088",
+    "global_segment_size": 107374182400
+}
+```
+
+逐字段说明：
+
+| 字段 | 值 | 含义 |
+|------|-----|------|
+| `metadata_server` | `"P2PHANDSHAKE"` | KV 块位置元数据通过对等握手交换，不走 etcd |
+| `protocol` | `"ascend"` | 使用昇腾专有 RDMA 传输协议 |
+| `device_name` | `""` | 自动选择 RDMA 网卡，留空即可 |
+| `use_ascend_direct` | `true` | 启用昇腾 NPU 直接 DMA 访问，减少 CPU 中转 |
+| `master_server_address` | `"ip:50088"` | mooncake_master 地址，用于 DRAM 段注册和淘汰协调 |
+| `global_segment_size` | `107374182400` | 每节点贡献到全局池的 DRAM 大小 = **100 GiB**（100 × 1024³ bytes） |
+
+##### 步骤 3：配置环境变量
+
+```bash
+# 昇腾 Python 库路径（使 MooncakeDistributedStore 找到底层驱动）
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
+
+# 告知 vLLM 在哪里找 mooncake 配置文件
+export MOONCAKE_CONFIG_PATH="/path/to/mooncake.json"
+
+# KV 传输缓冲区池：格式 <数量>:<每个大小MB>
+# 4 个缓冲区 × 8MB = 32MB 缓冲区总量
+export ASCEND_BUFFER_POOL=4:8
+```
+
+> **`ASCEND_BUFFER_POOL` 调优**：缓冲区用于 NPU KV Cache ↔ DRAM 之间的中间暂存。如果并发请求多、KV 体积大，可适当增大（如 `8:16`）；内存紧张时缩小。
+
+##### 步骤 4：启动每个 vLLM 节点
+
+```bash
+vllm serve /path/to/Qwen2.5-72B-Instruct/ \
+  --served-model-name qwen \
+  --dtype bfloat16 \
+  --max-model-len 25600 \
+  --tensor-parallel-size 4 \
+  --host <this_node_ip> \
+  --port 8002 \
+  --kv-transfer-config '{
+    "kv_connector": "MooncakeConnectorStoreV1",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "use_layerwise": false,
+      "mooncake_rpc_port": "0",
+      "load_async": true,
+      "register_buffer": true
+    }
+  }'
+```
+
+`kv_connector_extra_config` 逐参解释：
+
+| 参数 | 值 | 含义 |
+|------|-----|------|
+| `use_layerwise` | `false` | 所有层 KV 计算完成后**批量** PUT 到 Store（不支持逐层流水线） |
+| `mooncake_rpc_port` | `"0"` | MooncakeStore RPC 端口自动分配（0 = 随机） |
+| `load_async` | `true` | GET 操作异步发起，不阻塞 Decode 前向直到真正需要该层数据 |
+| `register_buffer` | `true` | 启动时将 NPU KV Cache 内存注册到 RDMA NIC，避免每次传输重复注册（节省约 100ms/请求） |
+
+##### 步骤 5（可选）：负载均衡代理
+
+多节点多实例时，前端加一层路由代理，将请求路由到命中率最高的节点：
+
+```bash
+python load_balance_proxy_server_example.py \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --backends <node0_ip>:8002 <node1_ip>:8002
+```
+
+---
+
+#### 7.8.3 数据流：完整请求生命周期
+
+```mermaid
+sequenceDiagram
+    participant CL as 客户端
+    participant SH as Scheduler<br/>(kv_both)
+    participant WK as Worker (NPU)
+    participant CV as MooncakeConnectorStoreV1
+    participant ST as MooncakeDistributedStore<br/>(DRAM 全局池)
+
+    rect rgb(220, 240, 255)
+        Note over SH,ST: 启动阶段（一次性）
+        WK->>CV: register_kv_caches(npu_kv_ptrs)
+        CV->>ST: 注册 NPU 内存到 MooncakeStore<br/>（register_buffer=true，RDMA NIC 预注册）
+    end
+
+    rect rgb(220, 255, 220)
+        Note over CL,ST: 路径A：KV 缓存命中（前缀已在全局池）
+        CL->>SH: 请求（含系统提示词 SP）
+        SH->>CV: get_num_new_matched_tokens(request)
+        CV->>ST: P2PHANDSHAKE 查询 SP block_hash 是否存在
+        ST-->>CV: 命中（位于 Node-1 DRAM 段）
+        CV-->>SH: extra_tokens = N（可跳过 N tokens 的 Prefill）
+        SH->>SH: 分配 KV blocks，标记"需从 Store 加载"
+        SH->>WK: build_connector_meta → ZMQ IPC → Worker
+        WK->>CV: start_load_kv(forward_context)
+        CV->>ST: RDMA GET（从 Node-1 DRAM → 本节点 NPU Cache）
+        Note over CV,ST: load_async=true：异步发起，继续调度
+        WK->>WK: 执行 Decode 前向计算
+        WK->>CV: wait_for_layer_load("layer_X")
+        CV-->>WK: 数据就绪，解除阻塞
+    end
+
+    rect rgb(255, 243, 205)
+        Note over CL,ST: 路径B：KV 缓存未命中（执行完整 Prefill 并写入池）
+        CL->>SH: 请求（新提示词，Store 中无缓存）
+        SH->>CV: get_num_new_matched_tokens → 返回 0
+        SH->>WK: 正常 Prefill 调度
+        WK->>WK: 逐层计算 KV（所有层）
+        WK->>CV: save_kv_layer(layer_name, kv_data)
+        Note over WK,CV: use_layerwise=false：各层回调先暂存<br/>直到 wait_for_save() 触发批量 PUT
+        WK->>CV: wait_for_save()
+        CV->>ST: RDMA PUT（批量写入 NPU KV → DRAM 全局池）
+        ST-->>CV: 写入确认
+        CV-->>WK: 保存完成，request_finished
+    end
+```
+
+**三个关键设计决策的原因：**
+
+| 决策 | 原因 |
+|------|------|
+| `use_layerwise=false` | MooncakeStore 的 PUT 是整块操作，逐层 PUT 会产生大量小 RPC，反而增加延迟 |
+| `load_async=true` | RDMA GET 延迟约 2–5μs/层，异步发起后立即继续调度，减少等待空闲 |
+| `register_buffer=true` | NPU 内存 RDMA 注册耗时约 100ms，启动时一次性完成，避免运行时每请求注册 |
+
+---
+
+#### 7.8.4 与 §7.6 LMCache + MooncakeStore 的架构对比
+
+```mermaid
+flowchart LR
+    subgraph NVIDIA["NVIDIA 路线（§7.6）"]
+        direction TB
+        A1["vLLM\nLMCacheConnectorV1"] --> A2["LMCache Engine\n多级存储 / 淘汰策略\nLRU / LFU 可配置"]
+        A2 --> A3["MooncakeStoreConnector\n(RemoteConnector 接口)"]
+        A3 --> A4["MooncakeDistributedStore\nRDMA DRAM 池"]
+    end
+    subgraph ASCEND["Ascend 路线（§7.8）"]
+        direction TB
+        B1["vLLM\nMooncakeConnectorStoreV1"] --> B2["MooncakeDistributedStore\nRDMA DRAM 池"]
+    end
+    style NVIDIA fill:#e8f4f8,stroke:#0066cc
+    style ASCEND fill:#f0f8e8,stroke:#006600
+```
+
+| 对比维度 | LMCache + MooncakeStore（§7.6） | MooncakeConnectorStoreV1（§7.8） |
+|----------|--------------------------------|----------------------------------|
+| 调用链层数 | 4 层（vLLM→LMCache→StoreConnector→Store） | 2 层（vLLM→Store） |
+| 多级存储 | ✅ GPU VRAM → CPU DRAM → NVMe SSD | ❌ 仅 DRAM |
+| 元数据协议 | etcd（强一致性中心服务） | P2PHANDSHAKE（去中心） |
+| 淘汰策略 | LRU/LFU（LMCache 层控制） | mooncake_master 统一管理 |
+| 调试复杂度 | 较高（LMCache 中间层日志链路长） | 较低（链路短，问题定位容易） |
+| 平台 | NVIDIA GPU | Ascend NPU |
+| 冷缓存层 | ✅（NVMe SSD 溢出） | ❌ |
+
+---
+
+#### 7.8.5 实测性能
+
+**测试环境**：
+- 2 节点 × Atlas 800T A2（各 4 张昇腾 NPU）
+- 模型：Qwen2.5-72B-Instruct，TP=4，max_model_len=25600
+- 并发：100 请求 / 25 并发
+
+| 场景 | TTFT (ms) | 相对基线加速比 |
+|------|-----------|----------------|
+| 无全局 KV 池（基线，完整 Prefill） | 2322 | 1.0× |
+| **本地 DRAM 命中**（同节点） | **739** | **3.14×** |
+| **跨节点 DRAM 命中**（RDMA GET） | **948** | **2.45×** |
+
+**性能分析**：
+- **本地命中 739ms**：跳过全部 Prefill 计算，等同于直接从 CPU DRAM memcpy 到 NPU Cache，约为基线的 32%
+- **跨节点命中 948ms**：在 739ms 基础上增加约 200ms 的跨节点 RDMA GET 延迟（100GbE RoCE 下合理）
+- **加速来源**：系统提示词（System Prompt）的 Prefill 计算完全跳过，约占总 TTFT 的 70%+
+
+---
+
+#### 7.8.6 从零理解核心实现逻辑
+
+虽然源码路径为 `vllm_ascend/distributed/kv_transfer/kv_connector/v1/mooncake_connector_store.py`，这里从 KVConnector V1 接口出发，推演 `MooncakeConnectorStoreV1` 的关键实现逻辑：
+
+```python
+class MooncakeConnectorStoreV1(KVConnectorBase_V1):
+    """
+    Ascend 全局 KV 池的简洁路线：直接对接 MooncakeDistributedStore
+    无 LMCache 中间层，无 ZMQ 自定义协议
+    """
+
+    def __init__(self, rank: int, local_rank: int, config: KVTransferConfig):
+        # 1. 从 MOONCAKE_CONFIG_PATH 加载 mooncake.json
+        cfg = json.load(open(os.environ["MOONCAKE_CONFIG_PATH"]))
+        # 2. 初始化 MooncakeDistributedStore 客户端
+        #    use_ascend_direct=True 允许 NPU 直接 DMA，无需 CPU 中转
+        self.store = MooncakeDistributedStore(
+            metadata_server=cfg["metadata_server"],   # "P2PHANDSHAKE"
+            protocol=cfg["protocol"],                  # "ascend"
+            master_server_address=cfg["master_server_address"],
+            global_segment_size=cfg["global_segment_size"],  # 100GB
+        )
+        # 3. 暂存待保存的 KV 数据（use_layerwise=False：全部计算完才 PUT）
+        self._pending_saves: dict[str, list] = {}
+        self.load_async = config.kv_connector_extra_config.get("load_async", True)
+
+    # ── Scheduler 侧 ──────────────────────────────────────────────────────
+
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int, bool]:
+        """
+        查询 MooncakeStore：请求的 KV block_hashes 是否已存在于全局 DRAM 池
+        通过 P2PHANDSHAKE 定位数据所在节点
+        """
+        block_hashes = request.kv_block_hashes  # Scheduler 已计算好的 block hash 列表
+        matched = 0
+        for bh in block_hashes[num_computed_tokens // BLOCK_SIZE:]:
+            key = self._make_key(bh)
+            if self.store.exists(key):
+                matched += BLOCK_SIZE
+            else:
+                break  # 前缀必须连续匹配
+        return matched, True  # is_async=True：异步加载，不阻塞调度
+
+    def build_connector_meta(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> "KVConnectorMetadata":
+        """
+        将需要加载/保存的 block 信息打包，通过 ZMQ IPC 发给 Worker 进程
+        包含：block_hash → store_key 的映射
+        """
+        meta = MooncakeStoreConnectorMetadata()
+        for req in scheduler_output.scheduled_new_reqs:
+            for block, bh in zip(req.new_blocks, req.new_block_hashes):
+                meta.add_load(block_id=block.block_id, store_key=self._make_key(bh))
+        for req in scheduler_output.finished_reqs:
+            if req.kv_computed_locally:
+                for block, bh in zip(req.blocks, req.block_hashes):
+                    meta.add_save(block_id=block.block_id, store_key=self._make_key(bh))
+        return meta
+
+    # ── Worker 侧 ─────────────────────────────────────────────────────────
+
+    def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]):
+        """
+        register_buffer=True：将 NPU KV Cache 内存注册到 MooncakeStore
+        RDMA NIC 预绑定，避免每次传输时动态注册（节省 ~100ms/请求）
+        """
+        for layer_name, cache_tensor in kv_caches.items():
+            ptr = cache_tensor.data_ptr()
+            size = cache_tensor.nbytes
+            self.store.register_buffer(ptr, size)
+        self._kv_caches = kv_caches
+
+    def start_load_kv(self, forward_context: "ForwardContext"):
+        """
+        load_async=True：对每个需要从 Store 加载的 block 发起异步 RDMA GET
+        节点间 P2PHANDSHAKE 定位数据位置，直接 RDMA 到本地 NPU Cache
+        """
+        meta = forward_context.kv_connector_metadata
+        self._load_futures = {}
+        for block_id, store_key in meta.load_items:
+            dst_ptr = self._get_block_ptr(block_id)
+            # 异步发起：RDMA GET from remote DRAM → local NPU Cache
+            future = self.store.async_get(store_key, dst_ptr)
+            self._load_futures[block_id] = future
+
+    def wait_for_layer_load(self, layer_name: str):
+        """
+        use_layerwise=False：MooncakeStore 按 block 整体传输，无逐层区分
+        实现为：等待该层涉及的所有 block future 完成
+        """
+        # 若 load_async=True，在真正需要时等待对应 block 的 future
+        for block_id, future in self._load_futures.items():
+            future.wait()  # 阻塞直到 RDMA GET 完成
+
+    def save_kv_layer(self, layer_name: str, kv_layer: "torch.Tensor", ...):
+        """
+        use_layerwise=False：暂存各层数据，不立即 PUT
+        等 wait_for_save() 调用时批量写入（减少 MooncakeStore RPC 次数）
+        """
+        for block_id, store_key in self._pending_saves_meta.items():
+            if block_id not in self._pending_saves:
+                self._pending_saves[block_id] = {}
+            self._pending_saves[block_id][layer_name] = (
+                self._get_block_ptr(block_id, layer_name), kv_layer.nbytes // num_blocks
+            )
+
+    def wait_for_save(self):
+        """
+        所有层计算完成后：批量 RDMA PUT NPU KV Cache → MooncakeDistributedStore DRAM
+        P2PHANDSHAKE 会广播新 key 的存在，使其他节点可见
+        """
+        for block_id, layers in self._pending_saves.items():
+            store_key = self._pending_saves_meta[block_id]
+            src_ptrs = [ptr for _, (ptr, _) in sorted(layers.items())]
+            sizes = [sz for _, (_, sz) in sorted(layers.items())]
+            # 批量 PUT：所有层一次性写入，减少 RPC overhead
+            self.store.put(store_key, src_ptrs, sizes)
+        self._pending_saves.clear()
+
+    def _make_key(self, block_hash: int) -> str:
+        """block_hash → store key（与 AscendStoreConnector 的 SHA-256 不同，
+        直接用 Scheduler 计算的 prefix hash）"""
+        return f"kv:{block_hash:016x}"
+```
+
+> **注**：以上为基于文档和接口规范的推演实现，具体细节以 vllm-ascend 源码为准。
+
+---
+
+#### 7.8.7 已知限制与适用场景
+
+**当前限制：**
+
+1. **仅支持 colocated**（`kv_both`）：所有节点既是 Prefiller 又是 Decoder，不支持 PD 专职分离
+2. **不支持逐层流水线**（`use_layerwise=false`）：无法将 KV 传输与 Decode 计算重叠，超长序列的 RDMA 等待会阻塞 Decode 启动
+3. **无 MLA 专项支持**：不支持 `consumer_is_to_put` 等面向 MLA 的优化
+4. **无冷缓存层**：仅 DRAM，无 NVMe SSD 溢出层，DRAM 预算决定缓存上限
+5. **已知传输问题**：在某些配置下存在 `Transfer slice failed with status: 103901`（ADXL 协议错误，见 vllm-ascend issue #5044）
+
+**适用场景（用哪个？）：**
+
+| 场景 | 选择 |
+|------|------|
+| PD colocated，追求简单部署，快速上线 | ✅ `MooncakeConnectorStoreV1` |
+| 系统提示词固定、高复用率（客服/RAG） | ✅ `MooncakeConnectorStoreV1` |
+| PD 完全分离（专职 Prefill / Decode 节点） | ❌ → 用 §7.7 `AscendStoreConnector` |
+| 需要 MLA 优化（GQA 变体模型） | ❌ → 用 §7.7 `AscendStoreConnector` |
+| 需要 MultiConnector（P2P + Pool 同时运行） | ❌ → 用 §7.7 `AscendStoreConnector` |
+| 需要逐层流水线（超长序列 Decode 早启动） | ❌ → 用 §7.7 `AscendStoreConnector` |
+
+---
+
 ## 第八章：Scheduler——高效批调度的艺术
 
 ### 8.1 理论背景：调度算法的权衡
@@ -4492,6 +4920,21 @@ def measure_ttft(engine: MiniVLLM, prompt_tokens: int, concurrent_decode: int) -
 
 7. **Chunked Prefill（Sarathi）**：Agrawal et al.
    https://arxiv.org/abs/2308.16369
+
+8. **vllm-ascend PD Colocated + MooncakeConnectorStoreV1 教程**
+   https://docs.vllm.com.cn/projects/ascend/en/latest/tutorials/pd_colocated_mooncake_multi_instance.html
+
+9. **vllm-ascend KV Pool 功能指南**（AscendStoreConnector + MooncakeConnectorStoreV1 对比）
+   https://docs.vllm.com.cn/projects/ascend/en/latest/user_guide/feature_guide/kv_pool.html
+
+10. **MooncakeStore 架构设计文档**（master/client 职责分工，P2P 数据流）
+    https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html
+
+11. **LMCache 博客：扩展 RemoteConnector——以 MooncakeStore 为例**
+    https://blog.lmcache.ai/en/2025/04/22/extending-lmcache-remote-connectors-mooncakestore-as-an-example/
+
+12. **vllm-ascend MooncakeConnector 部署指南**（GitHub Examples）
+    https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/mooncake_connector_deployment_guide.md
 
 ---
 
