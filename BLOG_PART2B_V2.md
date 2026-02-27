@@ -1575,6 +1575,35 @@ def _retrieve_layerwise(self, req_meta) -> Generator:
         yield  # vLLM 主循环: wait_for_layer_load() → 等该层 → 执行 Attention → next()
 ```
 
+**TP 去重优化：Round-Robin 存储 + Cyclic Shift 寻址**
+
+上述"内容寻址去重"解决了**同一 block 不被同一 rank 重复传输**的问题，但 TP 并行带来了另一层冗余：TP=4 时，同一 batch 的 KV 在 4 个 rank 上各不同（head 分片），但 block hash 完全相同（token 序列一致）。若每个 rank 独立存储，全局池实际存了 4 份冗余数据，存储容量利用率降至 25%。
+
+AscendStore 通过 **Round-Robin 分配 + Cyclic Shift 寻址** 将存储量压缩为 1/TP：
+
+```
+存储阶段（Round-Robin）
+──────────────────────────────────────────────────────────────
+block 0 → rank 0 存储（block_id % TP_size == 0）
+block 1 → rank 1 存储（block_id % TP_size == 1）
+block 2 → rank 2 存储（block_id % TP_size == 2）
+block 3 → rank 3 存储（block_id % TP_size == 3）
+block 4 → rank 0 存储（循环）
+...
+
+结果：每个 rank 只存 1/TP 的 block；PoolKey 中的 head_or_tp_rank
+      保证 rank 0/1/2/3 的 KV 内容不混淆（head 分片不同）
+
+读取阶段（Cyclic Shift 寻址）
+──────────────────────────────────────────────────────────────
+rank R 需要 block B 的 KV：
+  目标 rank = B % TP_size          # 计算该 block 存在哪个 rank
+  PoolKey.head_or_tp_rank = 目标rank
+  向目标 rank 的存储地址发起 GET   # 跨 rank RDMA 读取
+```
+
+> **实现位置**：`pool_worker.py:580+` 的 `lookup_scheduler` 方法；PoolKey 中 `head_or_tp_rank` 字段的设计正是为此服务。
+
 ---
 
 #### 7.4.6 MooncakeDistributedStore 后端
@@ -1689,6 +1718,49 @@ class MooncakeBackend(Backend):
          ↓
   如果 node1 故障，MooncakeStore 可从副本节点读取（ReplicateConfig 可配多副本）
 ```
+
+**两种后端的数据流对比：Mooncake vs MemCache**
+
+AscendStoreConnector 支持两种存储后端，数据路径完全不同，直接决定了 `ASCEND_BUFFER_POOL` 的必要性与延迟特征：
+
+```
+Mooncake 后端（A2/A3 通用，需要 Transfer Buffer 中转）
+──────────────────────────────────────────────────────────────────
+存储路径：NPU KV Cache
+              │  [D2D，NPU内部总线]
+              ▼
+         Transfer Buffer（ASCEND_BUFFER_POOL 配置的缓冲区）
+              │  [跨节点 D2D，昇腾 HCCS/RDMA]
+              ▼
+         远端 Transfer Buffer
+              │  [D2H，Host DRAM 写入]
+              ▼
+         远端 Host DRAM（全局池存储）
+
+读取路径：远端 Host DRAM → 远端 Transfer Buffer → [跨节点 D2D]
+           → 本地 Transfer Buffer → [D2D] → NPU KV Cache
+
+⚠️ A3 硬件已知问题：D2D 与跨节点 D2D 共享同一总线，
+   高并发时两路流量互相干扰，导致性能退化。
+
+MemCache 后端（需要 A3 及以上，昇腾统一寻址）
+──────────────────────────────────────────────────────────────────
+存储路径：NPU KV Cache
+              │  [D2RH，直接写入远端 Host DRAM，统一寻址]
+              ▼
+         远端 Host DRAM（全局池存储）
+
+读取路径：远端 Host DRAM
+              │  [RH2D，直接读入 NPU KV Cache，统一寻址]
+              ▼
+         NPU KV Cache
+
+✅ 减少一次 D2D 中转，路径更短，延迟更低
+✅ 无需 ASCEND_BUFFER_POOL Transfer Buffer
+⚠️ 仅支持 A3 及以上硬件（依赖昇腾统一寻址能力）
+```
+
+这也解释了 §7.5.2 部署配置中为什么 `ASCEND_BUFFER_POOL` 环境变量仅在 Mooncake 后端下必须设置，MemCache 后端可省略。
 
 ---
 
