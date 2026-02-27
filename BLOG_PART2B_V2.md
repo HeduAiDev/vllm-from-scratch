@@ -4,7 +4,7 @@
 >
 > **阅读前提**：已读第二部分第六章（单机 Prefix Cache），理解块级哈希前缀匹配。
 >
-> **快速阅读**：只需 §7.1 → §7.2 → §7.3 即可掌握 NVIDIA GPU 集群上全局 KV 池的完整方案。
+> **快速阅读**：NVIDIA GPU 路线 — §7.1 → §7.2 → §7.3；Ascend（昇腾）路线 — §7.1 → §7.2 → §7.4 → §7.5。
 
 ---
 
@@ -1033,7 +1033,7 @@ class MinimalLMCacheConnector(KVConnectorBase_V1):
 
 > 源码路径：`vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/`
 
-7.5 节的模拟实现揭示了全局 KV 池的设计原理。vllm-ascend 的 **AscendStore** 是真实生产中的全局 KV 池实现，是本章的核心方案。本节将逐层拆解其四层架构、关键数据结构、请求生命周期、传输线程精髓，以及 MooncakeDistributedStore 后端原理，最后提供完整的"从零手搓"七步实现骨架。
+7.8 节的模拟实现揭示了全局 KV 池的设计原理。vllm-ascend 的 **AscendStore** 是真实生产中的全局 KV 池实现，是本章的核心方案。本节将逐层拆解其四层架构、关键数据结构、请求生命周期、传输线程精髓，以及 MooncakeDistributedStore 后端原理，最后提供完整的"从零手搓"七步实现骨架。
 
 #### 7.4.1 完整四层架构
 
@@ -1077,7 +1077,7 @@ flowchart TD
     RT <-->|"RDMA batch_get"| MB
 ```
 
-**与 7.5 模拟版的对应关系：**
+**与 7.8 模拟版的对应关系：**
 
 | 模拟版 | AscendStore 对应组件 | 职责 |
 |--------|---------------------|------|
@@ -1628,7 +1628,7 @@ rank R 需要 block B 的 KV：
 | 字段 | 含义 |
 |------|------|
 | `metadata_server` | etcd 地址，存储全局 key→local_seg 映射（哪个节点有哪些 block） |
-| `global_segment_size` | 每节点注册给全局池的显存大小（64 GB） |
+| `global_segment_size` | 每节点注册给全局池的显存大小。支持整数（bytes）或字符串（`"1GB"`、`"512MB"`）；**生产部署建议从 `"1GB"` 起步**，过大值（100GB 级别整数）会导致 mooncake 初始化失败（见 §7.5.2） |
 | `local_buffer_size` | 本地传输缓冲区大小（4 GB） |
 | `protocol` | 传输协议：`rdma`（InfiniBand）或 `ascend`（华为 HCCS） |
 | `master_server_address` | MooncakeStore master 节点地址（负责传输协调） |
@@ -2203,7 +2203,7 @@ Node 1（Decode 节点）：新请求，命中全局池
 
 #### 7.4.9 本节小结
 
-| 特性 | 模拟版（7.5） | 上游 MooncakeConnector | vllm-ascend AscendStore |
+| 特性 | 模拟版（7.8） | 上游 MooncakeConnector | vllm-ascend AscendStore |
 |------|--------------|----------------------|------------------------|
 | **范围** | 教学用 | P2P（仅 PD 分离） | 全局 KV 池（所有节点共享） |
 | **存储** | Python dict | 无持久化 | MooncakeDistributedStore (RDMA) |
@@ -2264,6 +2264,8 @@ Worker    → 立即开始 Decode 前向计算（KV 可能尚未到达！）
 | 通用生产环境 | 同步加载 | `use_layerwise=false`（默认） |
 | 超长序列（>32K tokens） | 逐层加载 | `use_layerwise=true` |
 | 异步加载 | ❌ 暂不推荐 | 存在正确性风险，待官方修复 |
+
+至此，§7.4 完整覆盖了 AscendStoreConnector 的四层架构、关键数据结构、请求生命周期、传输线程、后端原理与加载策略。**接下来 §7.5 给出最快上手的 colocated 部署路线**——配置精简，适合快速验证效果；MultiConnector 与 PD 分离等进阶场景见 §7.5.8。
 
 ---
 
@@ -2709,8 +2711,7 @@ Prefill 节点写入全局池，Decode 节点从全局池读取，**P 和 D 之�
 
 > `consumer_is_to_load: true`：consumer 侧主动从全局池发起加载（而非等待 producer 推送）。
 
----
-
+三种部署模式覆盖了绝大多数生产场景：**colocated**（最简，快速上线）→ **MultiConnector**（即时 P2P + 异步池化并行）→ **池化 PD 分离**（极限解耦，独立扩容 P/D 节点）。路线图信息：vllm-ascend 正在研发异步调度修复、All-Gather 协同加载与 Smart Offload 等优化，预计在后续版本中落地。
 
 ---
 
