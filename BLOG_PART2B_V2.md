@@ -1101,26 +1101,37 @@ flowchart TD
 **PoolKey：内容寻址存储键**
 
 ```python
-# config_data.py
-import hashlib, dataclasses
+# config_data.py（源码：config_data.py:14-52）
+
+@dataclasses.dataclass
+class KeyMetadata:
+    """PoolKey 的元数据部分，描述 KV 所属的计算位置"""
+    model_name: str         # 模型名称（不同模型 KV 形状不通用）
+    head_or_tp_rank: int    # TP rank（各 rank 存不同 head 的 KV）
+    pcp_rank: int           # Prefill Context Parallel rank（上下文并行维度）
+    dcp_rank: int           # Decode  Context Parallel rank（上下文并行维度）
+    pp_rank: int            # Pipeline Parallel rank（各 stage 层不同）
 
 @dataclasses.dataclass
 class PoolKey:
-    model_name: str         # 模型名称（不同模型 KV 形状不通用）
-    head_or_tp_rank: int    # TP 并行时区分不同 rank（各 rank KV 数据不同）
-    chunk_hash: bytes       # SHA-256(token_ids.tobytes())，内容寻址核心
-    pp_rank: int = 0        # PP 并行时区分不同流水线阶段（各 stage 层不同）
+    key_metadata: KeyMetadata
+    chunk_hash: str         # 已是 hex 字符串（由 vLLM core BlockHash 传入）
 
     def to_string(self) -> str:
-        """生成全局唯一存储键，格式：model@head:rank@pp:stage@hexhash"""
-        hash_hex = self.chunk_hash.hex()
-        return (f"{self.model_name}"
-                f"@head:{self.head_or_tp_rank}"
-                f"@pp:{self.pp_rank}"
-                f"@{hash_hex}")
+        """生成全局唯一存储键，格式：model@pcp{n}@dcp{n}@head_or_tp_rank:{n}@pp_rank:{n}@hash"""
+        return (
+            f"{self.key_metadata.model_name}"
+            f"@pcp{self.key_metadata.pcp_rank}"
+            f"@dcp{self.key_metadata.dcp_rank}"
+            f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}"
+            f"@pp_rank:{self.key_metadata.pp_rank}"
+            f"@{self.chunk_hash}"
+        )
 ```
 
-为什么要把 `tp_rank` 编入 key？
+> **⚠️ pcp_rank / dcp_rank 说明**：`pcp` = Prefill Context Parallel rank，`dcp` = Decode Context Parallel rank，用于支持异构 TP 场景下的精确寻址（一线系统设计文档：Key 结构设计为 `model(@pp)(@pcp)(@dcp)@head_or_tp_rank@hash`）。
+
+为什么要把 `tp_rank` / `pcp_rank` / `dcp_rank` 全部编入 key？
 
 ```
 TP=4 时，同一 block 的 KV 在 4 个 rank 上各不同：
@@ -1129,35 +1140,55 @@ TP=4 时，同一 block 的 KV 在 4 个 rank 上各不同：
   rank 2 存 head 16~23 的 K/V
   rank 3 存 head 24~31 的 K/V
 
-所以 PoolKey 必须包含 tp_rank，避免跨 rank 混用 KV 数据。
+pcp/dcp rank 进一步区分异构 TP 场景下 Prefill/Decode 侧的上下文并行分片。
+所有维度都编入 key，才能在全局池中精确寻址，避免跨 rank 混用 KV 数据。
 ```
 
-**ChunkedTokenDatabase：调度器侧的 block 哈希缓存**
+**ChunkedTokenDatabase：把 block_hashes 映射成 PoolKey 序列**
+
+> **⚠️ 关键纠正**：`ChunkedTokenDatabase` **不计算 hash**。SHA-256 由 vLLM 核心调度器通过 `BlockHash` 机制完成，`ChunkedTokenDatabase` 只是接收这些哈希值、做 `bytes→hex` 格式转换、生成 `PoolKey`。
 
 ```python
-# config_data.py（概念简化版）
-import hashlib
-import numpy as np
+# config_data.py（源码：config_data.py:139-181）
 
 class ChunkedTokenDatabase:
-    """把 token 序列分块，维护每块的 SHA-256 哈希（避免重复计算）"""
+    """将 token 序列按 block 切分，把外部传入的 block_hashes 映射成 PoolKey 列表"""
 
-    def __init__(self, block_size: int):
+    def __init__(self, block_size: int, key_metadata: KeyMetadata):
         self.block_size = block_size
-        self._hash_db: dict[int, bytes] = {}  # block_idx → SHA-256 digest
+        self.key_metadata = key_metadata
 
-    def update(self, token_ids: list[int]) -> None:
-        """计算并缓存所有完整块的哈希值"""
-        for idx in range(len(token_ids) // self.block_size):
-            if idx in self._hash_db:
-                continue  # 已计算，跳过
-            chunk = token_ids[idx * self.block_size:(idx + 1) * self.block_size]
-            self._hash_db[idx] = hashlib.sha256(
-                np.array(chunk, dtype=np.int32).tobytes()
-            ).digest()  # 返回 bytes（32 字节）
+    def process_tokens(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash] | list[str],  # 来自 vLLM core，非本类计算
+        mask_num: int = 0,
+    ) -> Iterable[tuple[int, int, PoolKey]]:
+        """
+        将 vLLM core 计算好的 block_hashes 转换为 (start, end, PoolKey) 三元组序列。
 
-    def get_hashes(self, num_blocks: int) -> list[bytes]:
-        return [self._hash_db[i] for i in range(num_blocks)]
+        注意：
+        - BlockHash 是 bytes 类型时做 .hex() 转换；已是 str 时直接使用
+        - PoolKey 中的 chunk_hash 是 hex string，而非原始 bytes
+        """
+        if block_hashes and not isinstance(block_hashes[0], str):
+            block_hashes = [h.hex() for h in block_hashes]  # bytes → hex，不重新计算
+
+        for chunk_id, hash_val in enumerate(block_hashes):
+            start_idx = chunk_id * self.block_size
+            end_idx   = min(start_idx + self.block_size, token_len)
+            yield start_idx, end_idx, self._make_key_by_hash(hash_val)
+
+    def _make_key_by_hash(self, hash_val: str) -> PoolKey:
+        return PoolKey(key_metadata=self.key_metadata, chunk_hash=hash_val)
+```
+
+**哈希计算责任分工**：
+```
+vLLM Scheduler
+  └── BlockHash 计算（基于 token_ids 内容，跨节点一致性依赖 PYTHONHASHSEED=0）
+       └── 传入 ChunkedTokenDatabase.process_tokens(block_hashes=...)
+            └── 只做 bytes→hex，生成 PoolKey，查询全局池
 ```
 
 **ReqMeta 与 LoadSpec：请求元数据**
@@ -2115,6 +2146,55 @@ Node 1（Decode 节点）：新请求，命中全局池
 
 ---
 
+#### 7.4.10 三种加载策略与权衡
+
+`AscendStoreConnector` 加载全局池 KV 时有三种策略，选择直接影响延迟和正确性：
+
+**策略一：同步加载（Sync Load）—— 默认，生产推荐**
+
+```
+Scheduler → get_num_new_matched_tokens() → 命中 N blocks
+Worker    → start_load_kv()   → 发起 GET
+Worker    → wait_for_layer_load() → 阻塞，等待所有层 KV 到齐
+Worker    → 开始 Decode 前向计算
+```
+
+- **优点**：实现简单，无数据竞争，结果正确
+- **缺点**：Decode 必须等待全部 KV 加载完成，KV 较大时有等待开销
+- **适用**：KV 体积适中，传输延迟可接受
+
+**策略二：异步加载（Async Load）—— ⚠️ 存在正确性风险**
+
+```
+Scheduler → get_num_new_matched_tokens() → 命中 N blocks
+Worker    → start_load_kv() → 异步发起 GET，不等待
+Worker    → 立即开始 Decode 前向计算（KV 可能尚未到达！）
+```
+
+- **优点**：理论上 Decode 计算与 KV 传输并行，降低 TTFT
+- **⚠️ 已知问题**：**Batch 组装陷阱**——调度器可能在 KV 尚未就绪时将请求组入 Decode batch，导致使用未初始化的 KV 数据，产生错误推理输出。当前实现中异步加载存在正确性风险，**生产环境不建议使用**。
+
+**策略三：逐层加载（Layer-wise，use_layerwise=true）**
+
+```
+第 0 层 KV 传输 → Decode layer 0 计算 │ 第 1 层 KV 传输（并行）
+第 1 层 KV 传输完 → Decode layer 1 计算 │ 第 2 层 KV 传输...
+```
+
+- **优点**：第 N 层 KV 到达后立即计算，Decode 与传输流水线重叠
+- **⚠️ 已知问题**：逐层传输产生大量小包，RDMA 场景下小包性能退化严重（每层一个 PUT/GET）
+- **适用**：超长序列场景，总传输量大到必须与计算重叠才能接受延迟
+
+**选型建议**：
+
+| 场景 | 建议策略 | 配置 |
+|------|---------|------|
+| 通用生产环境 | 同步加载 | `use_layerwise=false`（默认） |
+| 超长序列（>32K tokens） | 逐层加载 | `use_layerwise=true` |
+| 异步加载 | ❌ 暂不推荐 | 存在正确性风险，待官方修复 |
+
+---
+
 ### 7.5 vllm-ascend AscendStoreConnector：colocated 简洁部署实战
 
 > **⚠️ 命名纠正**：本节原标题为"MooncakeConnectorStoreV1"，这是一个已被**废弃的别名**。根据最新源码（[`__init__.py:26-30`](https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/distributed/kv_transfer/__init__.py#L26)），`MooncakeConnectorStoreV1` 和 `AscendStoreConnector` 注册**完全相同的 Python 类**：
@@ -2192,15 +2272,15 @@ flowchart TD
 
 ```bash
 mooncake_master --port 50088 \
-  --eviction_high_watermark_ratio 0.95 \
-  --eviction_ratio 0.05
+  --eviction_high_watermark_ratio 0.9 \
+  --eviction_ratio 0.15
 ```
 
 | 参数 | 含义 |
 |------|------|
 | `--port 50088` | mooncake_master 监听端口，需全集群可达 |
-| `--eviction_high_watermark_ratio 0.95` | DRAM 池使用率达 95% 时触发淘汰 |
-| `--eviction_ratio 0.05` | 每次淘汰释放 5% 空间，防止频繁抖动 |
+| `--eviction_high_watermark_ratio 0.9` | DRAM 池使用率达 90% 时触发淘汰（一线生产值，更保守，避免 OOM） |
+| `--eviction_ratio 0.15` | 每次淘汰释放 15% 空间（一线生产值，更积极清理，避免频繁触发） |
 
 ##### 步骤 2：编写 mooncake.json
 
@@ -2209,9 +2289,8 @@ mooncake_master --port 50088 \
     "metadata_server": "P2PHANDSHAKE",
     "protocol": "ascend",
     "device_name": "",
-    "use_ascend_direct": true,
     "master_server_address": "<your_master_ip>:50088",
-    "global_segment_size": 107374182400
+    "global_segment_size": "1GB"
 }
 ```
 
@@ -2222,25 +2301,32 @@ mooncake_master --port 50088 \
 | `metadata_server` | `"P2PHANDSHAKE"` | KV 块位置元数据通过对等握手交换，不走 etcd |
 | `protocol` | `"ascend"` | 使用昇腾专有 RDMA 传输协议 |
 | `device_name` | `""` | 自动选择 RDMA 网卡，留空即可 |
-| `use_ascend_direct` | `true` | 启用昇腾 NPU 直接 DMA 访问，减少 CPU 中转 |
 | `master_server_address` | `"ip:50088"` | mooncake_master 地址，用于 DRAM 段注册和淘汰协调 |
-| `global_segment_size` | `107374182400` | 每节点贡献到全局池的 DRAM 大小 = **100 GiB**（100 × 1024³ bytes） |
+| `global_segment_size` | `"1GB"` | 每节点向全局池注册的 DRAM 段大小，支持字符串单位（`"1GB"`、`"512MB"` 等）。**⚠️ 一线警告：设置过大（如 100GB 整数）会导致 mooncake 底层 segment 注册时内存分配错误，初始化失败。建议从 `"1GB"` 开始调优。** |
 
 ##### 步骤 3：配置环境变量
 
 ```bash
-# 昇腾 Python 库路径（使 MooncakeDistributedStore 找到底层驱动）
-export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
+# 【🔴 必须】跨节点 hash 一致性：不设则相同 token 序列在不同节点产生不同 hash，
+# prefix cache 跨节点命中率为 0！（注意：§7.4 缺点列表已提及，此处部署步骤不可省略）
+export PYTHONHASHSEED=0
 
-# 告知 vLLM 在哪里找 mooncake 配置文件
-export MOONCAKE_CONFIG_PATH="/path/to/mooncake.json"
-
-# KV 传输缓冲区池：格式 <数量>:<每个大小MB>
+# 【必须】KV 传输缓冲区池：格式 <数量>:<每个大小MB>
 # 4 个缓冲区 × 8MB = 32MB 缓冲区总量
 export ASCEND_BUFFER_POOL=4:8
+
+# 【必须】mooncake 配置文件路径
+export MOONCAKE_CONFIG_PATH="/path/to/mooncake.json"
+
+# 【建议】连接和传输超时（毫秒）；不设可能导致网络抖动时连接/传输超时报错
+export ASCEND_CONNECT_TIMEOUT=10000
+export ASCEND_TRANSFER_TIMEOUT=10000
+
+# 【按需】昇腾 Python 库路径（若 MooncakeDistributedStore 找不到驱动时设置）
+# export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
 ```
 
-> **`ASCEND_BUFFER_POOL` 调优**：缓冲区用于 NPU KV Cache ↔ DRAM 之间的中间暂存。如果并发请求多、KV 体积大，可适当增大（如 `8:16`）；内存紧张时缩小。
+> **`ASCEND_BUFFER_POOL` 调优**：缓冲区用于 NPU KV Cache ↔ DRAM 之间的中间暂存（仅 Mooncake 后端需要；MemCache 后端利用统一寻址直接访问，无需此缓冲）。并发请求多、KV 体积大时可适当增大（如 `8:16`）。
 
 ##### 步骤 4：启动每个 vLLM 节点
 
@@ -2256,23 +2342,22 @@ vllm serve /path/to/Qwen2.5-72B-Instruct/ \
     "kv_connector": "AscendStoreConnector",
     "kv_role": "kv_both",
     "kv_connector_extra_config": {
-      "use_layerwise": false,
-      "mooncake_rpc_port": "0",
-      "load_async": true,
-      "register_buffer": true
+      "backend": "mooncake",
+      "lookup_rpc_port": "0",
+      "use_layerwise": false
     }
   }'
 # 注：旧版文档可能使用 "MooncakeConnectorStoreV1"，该名称已废弃，效果完全相同，但会打印 warning
 ```
 
-`kv_connector_extra_config` 逐参解释：
+`kv_connector_extra_config` 逐参解释（基于源码 `ascend_store_connector.py` 及一线部署指南）：
 
-| 参数 | 值 | 含义 |
-|------|-----|------|
-| `use_layerwise` | `false` | 所有层 KV 计算完成后**批量** PUT 到 Store（colocated 简洁模式推荐值；如需逐层流水线可设为 `true`） |
-| `mooncake_rpc_port` | `"0"` | MooncakeStore RPC 端口自动分配（0 = 随机） |
-| `load_async` | `true` | GET 操作异步发起，不阻塞 Decode 前向直到真正需要该层数据 |
-| `register_buffer` | `true` | 启动时将 NPU KV Cache 内存注册到 RDMA NIC，避免每次传输重复注册（节省约 100ms/请求） |
+| 参数 | 值 | 来源 | 含义 |
+|------|-----|------|------|
+| `backend` | `"mooncake"` | 一线部署指南 | 后端类型：`"mooncake"`（需 Transfer Buffer）或 `"memcache"`（统一寻址，无需 ASCEND_BUFFER_POOL） |
+| `lookup_rpc_port` | `"0"` | 一线部署指南 | LookupKeyServer RPC 监听端口（0 = 随机分配） |
+| `use_layerwise` | `false` | 源码 `get("use_layerwise", False)` | 是否逐层传输；colocated 简洁模式推荐 false（批量 PUT 减少 RPC 次数） |
+| `consumer_is_to_put` | `false`（默认） | 源码 `get("consumer_is_to_put", False)` | MLA/GQA 模型专项：consumer 侧反向写入，默认不开启 |
 
 ##### 步骤 5（可选）：负载均衡代理
 
@@ -2300,7 +2385,7 @@ sequenceDiagram
     rect rgb(220, 240, 255)
         Note over SH,ST: 启动阶段（一次性）
         WK->>CV: register_kv_caches(npu_kv_ptrs)
-        CV->>ST: 注册 NPU 内存到 MooncakeStore<br/>（register_buffer=true，RDMA NIC 预注册）
+        CV->>ST: 注册 NPU KV Cache 内存到 RDMA 引擎<br/>（启动时一次性，避免运行时重复注册）
     end
 
     rect rgb(220, 255, 220)
@@ -2314,7 +2399,7 @@ sequenceDiagram
         SH->>WK: build_connector_meta → ZMQ IPC → Worker
         WK->>CV: start_load_kv(forward_context)
         CV->>ST: RDMA GET（从 Node-1 DRAM → 本节点 NPU Cache）
-        Note over CV,ST: load_async=true：异步发起，继续调度
+        Note over CV,ST: GET 异步发起，继续调度其他工作
         WK->>WK: 执行 Decode 前向计算
         WK->>CV: wait_for_layer_load("layer_X")
         CV-->>WK: 数据就绪，解除阻塞
@@ -2335,13 +2420,13 @@ sequenceDiagram
     end
 ```
 
-**三个关键设计决策的原因：**
+**关键设计决策说明：**
 
-| 决策 | 原因 |
-|------|------|
-| `use_layerwise=false` | MooncakeStore 的 PUT 是整块操作，逐层 PUT 会产生大量小 RPC，反而增加延迟 |
-| `load_async=true` | RDMA GET 延迟约 2–5μs/层，异步发起后立即继续调度，减少等待空闲 |
-| `register_buffer=true` | NPU 内存 RDMA 注册耗时约 100ms，启动时一次性完成，避免运行时每请求注册 |
+| 配置选择 | 原因 |
+|---------|------|
+| `use_layerwise=false`（colocated 模式推荐） | 批量 PUT 减少 MooncakeStore RPC 次数；逐层 PUT 产生大量小包，在 RDMA 场景性能反而劣化 |
+| `backend="mooncake"` | 默认选择；A3 及以上硬件可选 `"memcache"` 后端（利用统一寻址直接 NPU↔Host DRAM，少一次 Transfer Buffer 拷贝） |
+| 启动时注册 NPU 内存 | RDMA NIC 内存注册耗时约 100ms；`register_kv_caches()` 在启动时一次性完成，避免运行时每请求重复注册 |
 
 ---
 
@@ -2377,19 +2462,33 @@ flowchart LR
 
 #### 7.5.5 实测性能
 
-**测试环境**：
-- 2 节点 × Atlas 800T A2（各 4 张昇腾 NPU）
-- 模型：Qwen2.5-72B-Instruct，TP=4，max_model_len=25600
-- 并发：100 请求 / 25 并发
+**A2 硬件 + Mooncake 后端（colocated 混合模式）**：
+- 环境：2 节点 × Atlas 800T A2（各 4 张昇腾 NPU），Qwen2.5-72B-Instruct，TP=4，max_model_len=25600，100 请求 / 25 并发
 
-| 场景 | TTFT (ms) | 相对基线加速比 |
-|------|-----------|----------------|
+| 场景 | TTFT (ms) | TTFT 加速比 |
+|------|-----------|------------|
 | 无全局 KV 池（基线，完整 Prefill） | 2322 | 1.0× |
 | **本地 DRAM 命中**（同节点） | **739** | **3.14×** |
 | **跨节点 DRAM 命中**（RDMA GET） | **948** | **2.45×** |
 
-**性能分析**：
-- **本地命中 739ms**：跳过全部 Prefill 计算，等同于直接从 CPU DRAM memcpy 到 NPU Cache，约为基线的 32%
+**A2 硬件 + Mooncake 后端（一线系统设计文档，混合模式）**：
+
+| 指标 | 无池化基线 → 有池化 | 提升 |
+|------|-------------------|------|
+| TTFT | 基线 → 优化后 | **52.11% ↑** |
+| TPS（吞吐） | 基线 → 优化后 | **80.90% ↑** |
+
+**A3 硬件 + MemCache 后端（一线系统设计文档，混合模式）**：
+
+| 指标 | 无池化基线 → 有池化 | 提升 |
+|------|-------------------|------|
+| TTFT | 基线 → 优化后 | **41.67% ↑** |
+| TPS（吞吐） | 基线 → 优化后 | **71.61% ↑** |
+
+> MemCache 后端（A3+）利用统一寻址，省去 Transfer Buffer 中转，延迟和吞吐均有额外提升空间。
+
+**性能分析（A2 colocated 数据）**：
+- **本地命中 739ms**：跳过全部 Prefill 计算，约为基线的 32%
 - **跨节点命中 948ms**：在 739ms 基础上增加约 200ms 的跨节点 RDMA GET 延迟（100GbE RoCE 下合理）
 - **加速来源**：系统提示词（System Prompt）的 Prefill 计算完全跳过，约占总 TTFT 的 70%+
 
@@ -2445,7 +2544,98 @@ class AscendStoreConnector(KVConnectorBase_V1):
 | 超长序列，Decode 需要早启动（传输与计算重叠） | `AscendStoreConnector` + `kv_both` + `use_layerwise=true` |
 | PD 完全分离（专职 Prefill / Decode 节点） | `AscendStoreConnector` + `kv_producer`/`kv_consumer`（§7.4） |
 | MLA 模型（DeepSeek 等 GQA 变体） | `AscendStoreConnector` + `consumer_is_to_put=true`（§7.4） |
-| 当前请求即时加速 + 沉淀未来复用 | `AscendStoreConnector` `MultiConnector` 模式（§7.4） |
+| 当前请求即时加速 + 沉淀未来复用 | `MultiConnector`（P2P + Pool 并行，见 §7.5.8） |
+
+---
+
+#### 7.5.8 进阶配置：MultiConnector 与池化 PD 分离
+
+以下配置来自一线部署指南，适合需要更高吞吐或更低延迟的生产场景。
+
+**配置一：MultiConnector（P2P 即时传 + Pool 异步写入，PD 分离）**
+
+P2P 降低**当前请求**延迟，Pool 沉淀 KV 供**后续相同前缀**复用，两者并行工作互不干扰。
+
+```json
+// Prefill 节点 kv-transfer-config
+{
+    "kv_connector": "MultiConnector",
+    "kv_role": "kv_producer",
+    "kv_connector_extra_config": {
+        "connectors": [
+            {
+                "kv_connector": "MooncakeConnectorV1",
+                "kv_role": "kv_producer",
+                "kv_connector_extra_config": {}
+            },
+            {
+                "kv_connector": "AscendStoreConnector",
+                "kv_role": "kv_producer",
+                "kv_connector_extra_config": {
+                    "backend": "mooncake",
+                    "lookup_rpc_port": "0"
+                }
+            }
+        ]
+    }
+}
+```
+
+```json
+// Decode 节点 kv-transfer-config
+{
+    "kv_connector": "MultiConnector",
+    "kv_role": "kv_consumer",
+    "kv_connector_extra_config": {
+        "connectors": [
+            {
+                "kv_connector": "MooncakeConnectorV1",
+                "kv_role": "kv_consumer",
+                "kv_connector_extra_config": {}
+            },
+            {
+                "kv_connector": "AscendStoreConnector",
+                "kv_role": "kv_consumer",
+                "kv_connector_extra_config": {
+                    "backend": "mooncake",
+                    "lookup_rpc_port": "0"
+                }
+            }
+        ]
+    }
+}
+```
+
+**配置二：池化 PD 分离（纯 AscendStoreConnector，无 P2P）**
+
+Prefill 节点写入全局池，Decode 节点从全局池读取，**P 和 D 之间无需直接通信**，所有数据经全局池中转。
+
+```json
+// Prefill 节点（kv_producer）
+{
+    "kv_connector": "AscendStoreConnector",
+    "kv_role": "kv_producer",
+    "kv_connector_extra_config": {
+        "backend": "mooncake",
+        "lookup_rpc_port": "0"
+    }
+}
+```
+
+```json
+// Decode 节点（kv_consumer）
+{
+    "kv_connector": "AscendStoreConnector",
+    "kv_role": "kv_consumer",
+    "kv_connector_extra_config": {
+        "backend": "mooncake",
+        "lookup_rpc_port": "0",
+        "consumer_is_to_load": true
+    }
+}
+```
+
+> `consumer_is_to_load: true`：consumer 侧主动从全局池发起加载（而非等待 producer 推送）。
 
 ---
 
@@ -3074,7 +3264,7 @@ def retrieve_layer(self, request) -> Generator:
 
 ### 7.7 [扩展] RDMA 从零到懂——完整技术指南
 
-> **本节定位**：§7.6 的源码反复出现 `batch_register_memory`、`RDMA WRITE/READ`、`QP`、`GPUDirect` 等词，但没有解释底层原理。**本章各 KV 传输方案的物理层都是 RDMA**，读懂它才能理解 §7.3/7.7/7.8 中的性能数字（为什么跨节点延迟是 2–5μs？为什么 `register_buffer=true` 能省去 100ms？）。
+> **本节定位**：§7.6 的源码反复出现 `batch_register_memory`、`RDMA WRITE/READ`、`QP`、`GPUDirect` 等词，但没有解释底层原理。**本章各 KV 传输方案的物理层都是 RDMA**，读懂它才能理解 §7.3/7.7/7.8 中的性能数字（为什么跨节点延迟是 2–5μs？为什么启动时预注册 NPU KV Cache 内存能省去约 100ms/请求？）。
 >
 > **没有 RDMA 硬件也可以继续**：§7.7.1 提供 SoftRoCE 软件模拟安装方法；§7.8 的全局池模拟也完全不依赖真实 NIC，可以直接运行验证概念。
 
