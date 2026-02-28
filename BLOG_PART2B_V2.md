@@ -99,7 +99,7 @@ vllm-ascend **不是 vLLM 的 Fork**，而是通过 `VLLM_PLUGINS` 机制在运�
 
 #### 7.2.3 现有方案全览
 
-目前业界有 **4 个实现方案**，覆盖两种路线和两种硬件平台：
+目前业界有 **5 个主流实现方案**，覆盖两种路线和两种硬件平台：
 
 | 方案 | 路线 | 平台 | 跨请求复用 | 共享持久存储 | PD 模式 | 可验证运行 |
 |------|------|------|-----------|------------|---------|----------|
@@ -107,6 +107,7 @@ vllm-ascend **不是 vLLM 的 Fork**，而是通过 `VLLM_PLUGINS` 机制在运�
 | **LMCache + MooncakeStore** | 全局存储池 | NVIDIA GPU | ✅ | ✅ DRAM+可选SSD | 分离/colocated | ✅ |
 | **vllm-ascend `MooncakeConnectorV1`**（注册名，Python 类 `MooncakeConnector`） | P2P（D-pull） | Ascend NPU | ❌ | ❌ | 分离 | ❌（需昇腾硬件） |
 | **vllm-ascend `AscendStoreConnector`** | 全局存储池 | Ascend NPU | ✅ | ✅ DRAM | 分离或colocated | ❌（需昇腾硬件） |
+| **vllm-ascend `UCMConnector`** | 全局存储池（分层） | Ascend NPU | ✅ | ✅ DRAM + 3FS/NFS（无容量上限） | colocated | ❌（需昇腾硬件 + UCM 库） |
 
 > **命名说明**：`MooncakeConnectorV1` 是 **KV Connector 注册名**（写入 `kv_connector` 配置），实际 Python 类为 `MooncakeConnector`。`MooncakeConnectorStoreV1` 是 `AscendStoreConnector` 的**向后兼容别名**（两者注册同一个类，使用前者会触发废弃警告），建议直接使用 `AscendStoreConnector`。
 
@@ -1165,6 +1166,77 @@ flowchart TD
 
 - **ZMQ 是 Intra-Node（同节点）的**：Scheduler Process 和 Worker Process 运行在同一台机器上，ZMQ IPC socket 只负责进程间通信。跨节点查询通过 MooncakeDistributedStore 的 etcd 元数据服务完成。
 - **`delay_free=False`**：与上游 MooncakeConnector（P2P 模式，`delay_free=True`）不同，AscendStore 是全局池，写入后 block 不依赖 D 节点持有，因此不需要延迟释放。
+
+**物理进程/线程视图（PD 分离 vs 混部）**
+
+> 下图厘清了两个常见困惑：① ZMQ 是**同节点进程间通信**（ipc:// Unix Socket，不跨机）；② mooncake_master + etcd 是**独立外部元数据服务**，每个 Worker 在启动时通过 TCP 注册本地内存段并持续查询 KV 索引。
+
+**PD 分离模式（kv_producer + kv_consumer）——典型 8 卡节点：**
+
+```mermaid
+flowchart TB
+    subgraph PF["Prefill 节点（kv_producer，8× NPU）"]
+        PFS["Scheduler Process<br/>─ KVPoolScheduler<br/>─ LookupKeyClient（ZMQ REQ）"]
+        subgraph PFW["Worker Process × 8（每张 NPU 卡一个 Python 进程）"]
+            PFR0["rank-0 / NPU-0<br/>─ LookupKeyServer（ZMQ REP 后台线程）<br/>─ KVCacheStoreSendingThread → batch_put"]
+            PFRN["rank 1~7 / NPU 1~7<br/>─ KVCacheStoreSendingThread → batch_put<br/>  （无 ZMQ Server）"]
+        end
+        PFS <-->|"ZMQ IPC<br/>ipc:///tmp/lookup_rpc_...<br/>节点内，不跨机"| PFR0
+    end
+
+    subgraph DC["Decode 节点（kv_consumer，8× NPU）"]
+        DCS["Scheduler Process<br/>─ KVPoolScheduler<br/>─ LookupKeyClient（ZMQ REQ）"]
+        subgraph DCW["Worker Process × 8（每张 NPU 卡一个 Python 进程）"]
+            DCR0["rank-0 / NPU-0<br/>─ LookupKeyServer（ZMQ REP 后台线程）<br/>─ KVCacheStoreRecvingThread → batch_get"]
+            DCRN["rank 1~7 / NPU 1~7<br/>─ KVCacheStoreRecvingThread → batch_get<br/>  （无 ZMQ Server）"]
+        end
+        DCS <-->|"ZMQ IPC<br/>节点内，不跨机"| DCR0
+    end
+
+    subgraph SVC["元数据 & 存储（独立节点 / 可与 P 或 D 合并）"]
+        META["mooncake_master + etcd<br/>全局 KV 索引服务"]
+        MDS["MooncakeDistributedStore<br/>跨节点 DRAM 池"]
+    end
+
+    PFW -->|"RDMA batch_put（跨节点）"| MDS
+    DCW -->|"RDMA batch_get（跨节点）"| MDS
+    PFW -.->|"TCP：启动时 store.setup() 注册"| META
+    DCW -.->|"TCP：注册 + 元数据查询"| META
+    style META fill:#fff3cd,stroke:#856404
+    style MDS fill:#cce5ff,stroke:#004085
+```
+
+**混部 colocated 模式（kv_both，单节点兼任 P 与 D）：**
+
+```mermaid
+flowchart TB
+    subgraph BOTH["单节点（kv_both，8× NPU）"]
+        BS["Scheduler Process<br/>─ KVPoolScheduler<br/>─ LookupKeyClient（ZMQ REQ）"]
+        subgraph BW["Worker Process × 8（每张 NPU 卡一个）"]
+            BR0["rank-0 / NPU-0<br/>─ LookupKeyServer（ZMQ REP 后台线程）<br/>─ KVCacheStoreSendingThread → batch_put（Prefill 后写入）<br/>─ KVCacheStoreRecvingThread → batch_get（Decode 前读取）"]
+            BRN["rank 1~7 / NPU 1~7<br/>─ SendingThread → batch_put<br/>─ RecvingThread → batch_get<br/>  （无 ZMQ Server）"]
+        end
+        BS <-->|"ZMQ IPC（节点内）"| BR0
+    end
+    subgraph SVC2["元数据 & 存储"]
+        META2["mooncake_master + etcd"]
+        MDS2["MooncakeDistributedStore<br/>（可部署于同节点或独立节点）"]
+    end
+    BW -->|"RDMA"| MDS2
+    BW -.->|"TCP 注册"| META2
+    style META2 fill:#fff3cd,stroke:#856404
+    style MDS2 fill:#cce5ff,stroke:#004085
+```
+
+> **三条通信通道总结：**
+>
+> | 通道 | 协议 | 跨节点？ | 作用 |
+> |------|------|----------|------|
+> | Scheduler ↔ rank-0 Worker | ZMQ IPC（`ipc://` Unix Socket） | **否**，同节点进程间 | Scheduler 查询"哪些 block 已缓存" |
+> | Worker ↔ MooncakeDistributedStore | RDMA（Ascend HCCL Protocol） | **是**，跨节点数据面 | 实际 KV 数据 PUT / GET |
+> | Worker → mooncake_master + etcd | TCP | **是**，跨节点控制面 | 启动时注册内存段，持续查询全局 KV 索引 |
+>
+> **只有 rank-0 Worker 启动 ZMQ REP Server**（源码：`if vllm_config.parallel_config.rank == 0: self.lookup_server = LookupKeyServer(...)`），其余 rank 不绑定 socket，Scheduler 始终只连接 rank-0。
 
 ---
 
@@ -3839,3 +3911,196 @@ def wait_for_kv(self, request_id: str, timeout: float = 5.0) -> bool:
   节省计算：254ms × 2 = 508ms
 ```
 
+---
+
+### 7.9 [扩展] vllm-ascend KV 传输生态：新增能力一览
+
+> 本节梳理 vllm-ascend v0.13.0 引入的几项 KV 传输新能力，作为前述章节的功能补完。
+
+#### 7.9.1 UCMConnector：无容量上限的分层 KV 存储
+
+**背景与动机**
+
+AscendStoreConnector 的全局池受限于 DRAM 总量（典型 32~64 GiB/节点）。当系统提示词库极大（数百万条）或需要跨天持久化时，DRAM 池容量不足。
+
+**UCM（Unified Cache Management）** 引入分层存储解决这一问题：
+
+```
+NPU HBM（working set）
+    ↕ KVConnector
+CPU DRAM（热缓存，本节点本地快速访问）
+    ↕ UCM 内部迁移
+共享持久存储（3FS / NFS / 企业级存储，跨节点共享，近乎无限容量）
+```
+
+与 AscendStoreConnector（只有 DRAM 池）的核心区别：UCM 把 DRAM 当**写缓冲/热缓存**，最终持久化到共享存储；冷数据从共享存储按需拉回 DRAM。
+
+**注册名与依赖**
+
+```python
+# __init__.py 中注册：
+KVConnectorFactory.register_connector(
+    "UCMConnector",
+    "vllm_ascend.distributed.kv_transfer.kv_pool.ucm_connector",
+    "UCMConnectorV1",
+)
+# UCMConnectorV1 是 ucm.integration.vllm.ucm_connector.UCMConnector 的薄包装层
+```
+
+安装依赖：需要单独安装 `ucm` Python 库（参考 [UCM 官方文档](https://ucm.readthedocs.io/en/latest/getting-started/quickstart_vllm_ascend.html)）。
+
+**配置示例**
+
+```python
+# vLLM 启动配置
+kv_transfer_config = {
+    "kv_connector": "UCMConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "UCM_CONFIG_FILE": "/path/to/ucm_config.yaml"
+    }
+}
+```
+
+```yaml
+# ucm_config.yaml（示例）
+ucm_connectors:
+  - ucm_connector_name: "UcmNfsStore"
+    ucm_connector_config:
+      store_path: "/nfs/kv_cache_store"   # NFS 挂载路径或本地目录
+```
+
+> **推荐场景**：固定系统提示词库超大（>100 万条）、需要跨天 KV 持久化复用、多集群共享同一 KV Store。
+
+---
+
+#### 7.9.2 MTP 层 KV 传输：PD 分离下的投机解码支持
+
+**背景**
+
+DeepSeek 等模型使用 **MTP（Multi-Token Prediction）** 技术——在标准 Transformer 层之后附加若干 MTP 辅助层（共享主干权重），一次 forward 预测多个 token，从而提升吞吐。
+
+在 PD 分离时，Prefill 节点必须把**主干层 + MTP 层**的 KV Cache 全部传给 Decode 节点。若遗漏 MTP 层，Decode 侧的投机解码将因缺少 KV 而产生错误。
+
+**源码实现**（`mooncake_connector.py`，仅 P2P MooncakeConnectorV1）：
+
+```python
+# 构建传输层索引范围
+first_layer_index, end_layer_index = self.pp_layer_indices[prefill_pp_rank]
+
+# 若启用了投机解码（MTP），最后一个 PP stage 需额外传输 1 个 MTP 层
+if self.vllm_config.speculative_config is not None:
+    if prefill_pp_rank == self._prefill_pp_size - 1:
+        end_layer_index = end_layer_index + 1   # 扩展到 MTP 层
+
+# 此后 end_layer_index 正常用于 RDMA 传输范围
+```
+
+> **注意**：此特性目前仅在 P2P `MooncakeConnectorV1` 中实现，AscendStoreConnector（全局池）路径下的 MTP 传输通过 KVPoolWorker 的标准 block_hashes 流程处理，无需特殊分支。
+
+---
+
+#### 7.9.3 NZ 格式 KV Cache 重排：Ascend NPU 原生内存优化
+
+**什么是 NZ 格式**
+
+Ascend NPU 的 AI Core 原生使用 **NZ（Non-standard Z-order）内存布局**（也称 fractal format）：将矩阵切成 16×16 小块后按 Z 形排列，相比标准行主序（ND 格式）显著提升 L1 Cache 命中率，加速注意力计算中的矩阵乘法。
+
+**PD 分离下的挑战**
+
+- Prefill 侧产出的 KV Cache 以标准 ND 格式存储（适合 RDMA 传输）
+- Decode 侧执行注意力计算时，NPU 更高效地处理 NZ 格式
+- **解决方案**：RDMA 传输完成后，在 Decode Worker 中将 KV Block 从 ND 重排为 NZ
+
+**源码路径**（`mooncake_connector.py`）：
+
+```python
+need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
+use_fused_op = ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK
+
+if need_nz_cache:
+    if use_fused_op and enable_custom_op():
+        # 使用融合算子（见 7.9.4）做高效重排
+        self.reformat_kv_cache_with_fused_op(...)
+    else:
+        # 回退到纯 Python 实现
+        self.reformat_kv_cache(..., need_nz_cache=True)
+```
+
+**控制开关**：`additional_config` 中设置 `enable_kv_nz: true`（v0.13.0 对 float weight 默认关闭，int8 量化建议开启）。
+
+---
+
+#### 7.9.4 融合算子优化：`transpose_kv_cache_by_block`
+
+**背景**
+
+PD 分离中，RDMA 传输后有两种后处理需求：
+1. **异构 TP 拼接**：P 侧 TP=4，D 侧 TP=2，需将多个 rank 的 head 拼合
+2. **NZ 格式重排**（§7.9.3）
+
+纯 Python 实现（`reformat_kv_cache`）需逐 block、逐 layer、逐 head 复制，CPU-GPU 往返多次，开销显著。
+
+**融合算子**
+
+vllm-ascend 为此实现了 Ascend 自定义算子 `transpose_kv_cache_by_block`，将整批 block 的 head 拼接在单次 NPU kernel 中完成：
+
+```python
+def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
+    k_caches, v_caches = [], []
+    for _, (k_cache_layer, v_cache_layer) in self.kv_caches.items():
+        k_caches.append(k_cache_layer)
+        v_caches.append(v_cache_layer)
+
+    block_ids_tensor = torch.tensor(flat_block_ids, dtype=torch.int64, device=device)
+
+    # 单次 NPU kernel，批量完成所有 block 的 KV 重排
+    torch.ops._C_ascend.transpose_kv_cache_by_block(
+        k_caches, v_caches,
+        block_ids_tensor,
+        block_size, num_kv_head, head_dim,
+        tp_num_need_pulls,   # TP 拼接倍数
+        layers
+    )
+```
+
+**控制开关**：环境变量 `VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK=true`（需搭配 CANN 8.5+ 及对应自定义算子库）。
+
+> **当前限制**：融合算子仅支持 GQA/MHA KV Cache 的 head 拼接（`need_cat_cache`），NZ 重排（`need_nz_cache`）暂时仍回退到 Python 实现。
+
+---
+
+#### 7.9.5 [已废弃] CPUOffloadingConnector
+
+> **⚠️ 废弃说明（v0.13.0）**：`CPUOffloadingConnector` 已在 vllm-ascend v0.13.0 中标记为废弃，**下个版本将移除**。功能将由 vLLM 上游的原生 CPU Offload 特性替代。新项目请勿使用此 Connector。
+
+**历史设计**（仅供理解源码参考）：
+
+`CPUOffloadingConnector` 用于**单节点 NPU KV Cache CPU 卸载**：把 NPU HBM 中溢出的 KV Block 搬到 CPU RAM，在需要时再搬回来，以扩大单节点有效 KV Cache 总量（类似虚拟内存 swap）。
+
+```
+┌──────────────────────────────────┐
+│           单节点                 │
+│  NPU HBM ←──── CPU RAM         │
+│  (working  copy_/non_blocking   │
+│   KV)     ──────→ CPU RAM       │
+│                  (spill KV)     │
+│  Scheduler Process              │
+│    ZMQ RPC → allocate_slots     │
+│    ← cpu_block_ids              │
+└──────────────────────────────────┘
+```
+
+架构：`CPUOffloadingConnectorScheduler`（ZMQ RPC 分配 CPU Block）+ `CPUOffloadingConnectorWorker`（PyTorch `copy_(non_blocking=True)` 搬移 KV）。不依赖 RDMA，完全在节点内完成。
+
+---
+
+#### 7.9.6 本节小结
+
+| 功能 | 状态 | 覆盖的 Connector | 核心收益 |
+|------|------|-----------------|---------|
+| UCMConnector | ✅ 生产可用 | UCMConnector（独立） | DRAM+持久化存储，无容量上限 |
+| MTP 层 KV 传输 | ✅ 生产可用 | MooncakeConnectorV1（P2P） | 投机解码 PD 分离正确性保障 |
+| NZ 格式重排 | ✅ 可用（量化场景推荐） | MooncakeConnectorV1（P2P） | Decode 侧 NPU 注意力计算加速 |
+| 融合算子 transpose_kv | ✅ CANN 8.5+ | MooncakeConnectorV1（P2P） | KV 重排批量融合，减少 NPU kernel 调用 |
+| CPUOffloadingConnector | ❌ **已废弃**（v0.13.0） | 独立（将删除） | 单节点 CPU RAM 扩容（历史方案） |
