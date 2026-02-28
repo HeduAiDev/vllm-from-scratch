@@ -632,24 +632,43 @@ def wait_for_layer_load(self, layer_name: str) -> None:
 
 **端到端时序**
 
-```
-Prefiller                     MooncakeStore              Decoder
-──────────────────────────────────────────────────────────────────
-Attn_0 → save_kv_layer(0) ──→ put(key_0, kv_0)
-Attn_1 → save_kv_layer(1) ──→ put(key_1, kv_1)
-...
-Attn_N → save_kv_layer(N) ──→ put(key_N, kv_N)
-wait_for_save() ─────────────────────────────────────────────────→
+```mermaid
+sequenceDiagram
+    participant PF as Prefiller<br/>(Machine B)
+    participant MS as MooncakeStore<br/>(全局 DRAM 池)
+    participant DE as Decoder<br/>(Machine A)
 
-                              ← get_num_new_matched_tokens() 查询 ─
-                                   is_exist(key_0..N) → 全部命中
-                              start_load_kv() ← ─────────────────
-                              get(key_0) ──────────────────────────→ wait_for_layer_load(0)
-                              get(key_1) ──────────────────────────→ wait_for_layer_load(1) → Attn_1
-                              ...
-──────────────────────────────────────────────────────────────────
-净效果：Decoder 跳过全部 Prefill 计算，转换为 N 次 RDMA 读取
+    rect rgb(210, 240, 210)
+        Note over PF,MS: ① Prefill 阶段：逐层异步写入（每层 Attention 结束后立即 PUT，不阻塞下一层计算）
+        PF->>MS: save_kv_layer(0) → put(key_0, kv_0)
+        PF->>MS: save_kv_layer(1) → put(key_1, kv_1)
+        Note over PF,MS: … (第 2 ~ N-1 层，并行写入)
+        PF->>MS: save_kv_layer(N) → put(key_N, kv_N)
+        PF->>PF: wait_for_save() — 确保全部写入完成
+    end
+
+    rect rgb(210, 220, 245)
+        Note over DE,MS: ② 调度阶段：Decoder 查询命中
+        DE->>MS: get_num_new_matched_tokens()<br/>→ is_exist(key_0 … key_N)
+        MS-->>DE: 全部命中 ✓（触发 KV 加载路径）
+    end
+
+    rect rgb(250, 235, 210)
+        Note over DE,MS: ③ 逐层加载 + 流水线计算（load 与 Attention 计算重叠）
+        DE->>MS: start_load_kv() → get(key_0)
+        MS-->>DE: kv_0
+        DE->>DE: wait_for_layer_load(0) → Attn_0（已有 kv_0，跳过 Prefill）
+        DE->>MS: get(key_1)
+        MS-->>DE: kv_1
+        DE->>DE: wait_for_layer_load(1) → Attn_1
+        Note over DE,MS: … (共 N+1 次 RDMA GET，替代 N+1 层 Prefill 计算)
+        DE->>MS: get(key_N)
+        MS-->>DE: kv_N
+        DE->>DE: wait_for_layer_load(N) → Attn_N → 开始 Decode 生成
+    end
 ```
+
+> **净效果**：Decoder 完全跳过 Prefill 计算，替换为 N+1 次跨节点 RDMA GET（延迟 ~2–5μs/次）。TTFT 从完整 Prefill 时间压缩到纯 IO 时间。
 
 ---
 
@@ -778,29 +797,47 @@ class MinimalMooncakeClient:
 
 **Step 2：ChunkedTokenDatabase —— 前缀感知查找**
 
+> **为什么不用链式 hash？**
+>
+> vLLM 本地 prefix cache 用链式 hash：`hash_n = hash(hash_{n-1}, tokens_n)`，每个 block 的 hash 依赖整个前缀。链式 hash 导致两条不同前缀的请求，即使 chunk N 的 token 序列完全相同，也会得到不同的 hash → **无法跨请求复用同一段 KV**。
+>
+> LMCache 的设计目标是**全局内容寻址**：Transformer 中 token i 的 K/V 值只取决于 token_id 和位置（RoPE angle）。因此 **相同 token_ids + 相同序列位置 → K/V 必然相同**，与该 chunk 之前的内容无关。这意味着可以用 `hash(token_ids) + 位置索引` 作 key，在不同请求之间自由复用，命中率远高于链式 hash。
+>
+> **关键约束：位置必须编入 key。** RoPE 让相同 token_ids 在不同位置的 K/V 值完全不同。若 key 中只含 token_ids hash 而不含 chunk 起始位置，则序列中不同偏移处的两个相同 chunk 会映射到同一个 key，加载时拿到的 KV 位置错误，产生静默错误推理输出。正确做法是 `f"{prefix}/blk{chunk_idx}/{chunk_hash}"`。
+
 ```python
 # minimal/chunked_token_db.py
 import hashlib, numpy as np
 
 class ChunkedTokenDatabase:
     """
-    把 token 序列分成固定大小的 chunk，为每个 chunk 计算内容哈希。
-    相同前缀的请求会产生相同的 key，实现跨请求 KV 复用。
+    把 token 序列分成固定大小的 chunk，用 (chunk位置, token内容) 双重定位 KV。
+
+    键设计：{prefix}/blk{chunk_idx}/{content_hash}
+      - chunk_idx：确保不同位置的相同 token 序列不会碰撞（RoPE 位置敏感）
+      - content_hash：确保不同 token 内容不会碰撞
+
+    为什么不用链式 hash（vLLM 风格）：
+      链式 hash 让 chunk N 的 key 依赖整个前缀，导致前缀不同的请求
+      无法复用相同 chunk 的 KV。内容寻址的命中率更高。
     """
 
     def __init__(self, chunk_size: int = 256):
         self.chunk_size = chunk_size
-        self._key_cache: dict[int, str] = {}  # chunk_idx → key string
 
     def get_keys(self, token_ids: list[int], prefix: str = "") -> list[str]:
         """为 token_ids 的每个完整 chunk 生成存储 key"""
         keys = []
-        for i in range(0, len(token_ids) - self.chunk_size + 1, self.chunk_size):
+        for chunk_idx, i in enumerate(
+            range(0, len(token_ids) - self.chunk_size + 1, self.chunk_size)
+        ):
             chunk = token_ids[i:i + self.chunk_size]
-            chunk_hash = hashlib.sha256(
+            content_hash = hashlib.sha256(
                 np.array(chunk, dtype=np.int32).tobytes()
             ).hexdigest()[:16]
-            key = f"{prefix}/{chunk_hash}"
+            # chunk_idx 编入 key：相同内容在不同位置的 KV 值因 RoPE 而不同，
+            # 必须区分；不能只用 content_hash。
+            key = f"{prefix}/blk{chunk_idx}/{content_hash}"
             keys.append(key)
         return keys
 
