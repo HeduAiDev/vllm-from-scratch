@@ -1649,34 +1649,20 @@ def _retrieve_layerwise(self, req_meta) -> Generator:
         yield  # vLLM 主循环: wait_for_layer_load() → 等该层 → 执行 Attention → next()
 ```
 
-**TP 去重优化：Round-Robin 存储 + Cyclic Shift 寻址**
+**TP 场景下的 PoolKey 设计**
 
-上述"内容寻址去重"解决了**同一 block 不被同一 rank 重复传输**的问题，但 TP 并行带来了另一层冗余：TP=4 时，同一 batch 的 KV 在 4 个 rank 上各不同（head 分片），但 block hash 完全相同（token 序列一致）。若每个 rank 独立存储，全局池实际存了 4 份冗余数据，存储容量利用率降至 25%。
-
-AscendStore 通过 **Round-Robin 分配 + Cyclic Shift 寻址** 将存储量压缩为 1/TP：
+TP=4 时，同一 block 在 4 个 rank 上存储的 K/V **内容不同**（各 rank 只有自己分到的 head 分片），因此必须用不同的 key 区分：
 
 ```
-存储阶段（Round-Robin）
-──────────────────────────────────────────────────────────────
-block 0 → rank 0 存储（block_id % TP_size == 0）
-block 1 → rank 1 存储（block_id % TP_size == 1）
-block 2 → rank 2 存储（block_id % TP_size == 2）
-block 3 → rank 3 存储（block_id % TP_size == 3）
-block 4 → rank 0 存储（循环）
-...
-
-结果：每个 rank 只存 1/TP 的 block；PoolKey 中的 head_or_tp_rank
-      保证 rank 0/1/2/3 的 KV 内容不混淆（head 分片不同）
-
-读取阶段（Cyclic Shift 寻址）
-──────────────────────────────────────────────────────────────
-rank R 需要 block B 的 KV：
-  目标 rank = B % TP_size          # 计算该 block 存在哪个 rank
-  PoolKey.head_or_tp_rank = 目标rank
-  向目标 rank 的存储地址发起 GET   # 跨 rank RDMA 读取
+rank 0 → PoolKey: ...@head_or_tp_rank:0@...@{hash}  (head 0–7 的 KV)
+rank 1 → PoolKey: ...@head_or_tp_rank:1@...@{hash}  (head 8–15 的 KV)
+rank 2 → PoolKey: ...@head_or_tp_rank:2@...@{hash}  (head 16–23 的 KV)
+rank 3 → PoolKey: ...@head_or_tp_rank:3@...@{hash}  (head 24–31 的 KV)
 ```
 
-> **实现位置**：`pool_worker.py:580+` 的 `lookup_scheduler` 方法；PoolKey 中 `head_or_tp_rank` 字段的设计正是为此服务。
+加载时，rank R 只能读取 `head_or_tp_rank=R` 的 entry，拿到的才是自己那份 head 分片。`head_or_tp_rank` 字段的核心作用正是在**相同 block hash 下区分不同 TP rank 的 KV 分片**，防止跨 rank 数据混用。
+
+> **例外：GQA/MLA 等 KV head 数极少的架构**，K/V 可能不参与 TP 分片——所有 rank 的 K/V 张量完全相同。此时 4 份存储确实冗余，可只让 1 个 rank 写入、其他 rank 读取同一 entry。`pool_worker.py:580+` 的 `lookup_scheduler` 对这类场景有专项处理，感兴趣可对照源码深入。
 
 ---
 
