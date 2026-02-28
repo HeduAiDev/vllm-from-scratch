@@ -758,28 +758,34 @@ python3 disagg_proxy_server.py \
 
 #### 7.3.7 从零手搓：LMCache + MooncakeStore 全套实现
 
-理解原理后，可以从零搭建一个精简版，覆盖端到端完整流程。
+理解原理后，从零搭建精简版，重点在于还原 LMCache 的**真实架构**。
+
+> **手撕对齐声明**：以下实现以 LMCache 源码为准，有意简化的地方会明确标注。如发现偏差，以源码为准。
+
+---
 
 **Step 1：MooncakeStore Client 封装**
 
 ```python
 # minimal/mooncake_client.py
-import os, json
 from mooncake.store import MooncakeDistributedStore
 
 class MinimalMooncakeClient:
-    """封装 MooncakeDistributedStore，提供简洁的 put/get/exists 接口"""
+    """
+    封装 MooncakeDistributedStore，提供 put/get/exists 接口。
+    参数名对齐 LMCache extra_config 字段（mooncake-{role}-config.yaml）。
+    """
 
     def __init__(self, config: dict):
         self.store = MooncakeDistributedStore()
         self.store.setup(
-            local_hostname=config["local_hostname"],
-            metadata_server=config["metadata_server"],
+            local_hostname=config["local_hostname"],       # 本机 IP，用于 RDMA 端点注册
+            metadata_server=config["metadata_server"],     # mooncake_master HTTP 元数据地址
             global_segment_size=config.get("global_segment_size", 32 * 1024**3),
             local_buffer_size=config.get("local_buffer_size", 1 * 1024**3),
             protocol=config.get("protocol", "rdma"),
-            rdma_devices=config.get("device_name", ""),
-            master_server_addr=config["master_server_address"],
+            device_name=config.get("device_name", ""),    # RDMA 网卡名，如 "mlx5_0"
+            master_server_address=config["master_server_address"],
         )
 
     def put(self, key: str, data: bytes) -> None:
@@ -795,249 +801,280 @@ class MinimalMooncakeClient:
         self.store.close()
 ```
 
-**Step 2：ChunkedTokenDatabase —— 前缀感知查找**
+---
 
-> **为什么不用链式 hash？**
+**Step 2：块哈希与存储键**
+
+> **关键架构澄清：LMCache 不自行计算 token 哈希。**
 >
-> vLLM 本地 prefix cache 用链式 hash：`hash_n = hash(hash_{n-1}, tokens_n)`，每个 block 的 hash 依赖整个前缀。链式 hash 导致两条不同前缀的请求，即使 chunk N 的 token 序列完全相同，也会得到不同的 hash → **无法跨请求复用同一段 KV**。
+> LMCache 收到的 `block_hashes` 由 **vLLM Scheduler** 计算后通过 `connector_metadata` 传入。
+> vLLM 使用**链式 SHA256**：
+> ```
+> hash_0 = sha256( pack(0)       ‖ tokens_0 )
+> hash_n = sha256( pack(hash_{n-1}) ‖ tokens_n )
+> ```
+> 每个 block 的 hash 依赖整个前序链，保证前缀不同的请求不会混用彼此的 KV。
 >
-> LMCache 的设计目标是**全局内容寻址**：Transformer 中 token i 的 K/V 值只取决于 token_id 和位置（RoPE angle）。因此 **相同 token_ids + 相同序列位置 → K/V 必然相同**，与该 chunk 之前的内容无关。这意味着可以用 `hash(token_ids) + 位置索引` 作 key，在不同请求之间自由复用，命中率远高于链式 hash。
+> LMCache 拿到这些 hash 后，按如下格式拼装存储键：
+> ```
+> vllm@{model_name}@{world_size}@{worker_id}@{block_hash:016x}
+> ```
+> 每层 KV 单独存一条 entry，key 再加 `@{layer_name}` 后缀。
 >
-> **关键约束：位置必须编入 key。** RoPE 让相同 token_ids 在不同位置的 K/V 值完全不同。若 key 中只含 token_ids hash 而不含 chunk 起始位置，则序列中不同偏移处的两个相同 chunk 会映射到同一个 key，加载时拿到的 KV 位置错误，产生静默错误推理输出。正确做法是 `f"{prefix}/blk{chunk_idx}/{chunk_hash}"`。
+> **以下 `VLLMBlockHasher` 仅用于独立演示时模拟 vLLM Scheduler 的哈希计算；
+> 真实 LMCache 中此步骤由 vLLM 完成，connector 直接消费传入的 block_hashes。**
 
 ```python
-# minimal/chunked_token_db.py
-import hashlib, numpy as np
+# minimal/block_hasher.py
+import hashlib, struct
+import numpy as np
 
-class ChunkedTokenDatabase:
+class VLLMBlockHasher:
     """
-    把 token 序列分成固定大小的 chunk，用 (chunk位置, token内容) 双重定位 KV。
-
-    键设计：{prefix}/blk{chunk_idx}/{content_hash}
-      - chunk_idx：确保不同位置的相同 token 序列不会碰撞（RoPE 位置敏感）
-      - content_hash：确保不同 token 内容不会碰撞
-
-    为什么不用链式 hash（vLLM 风格）：
-      链式 hash 让 chunk N 的 key 依赖整个前缀，导致前缀不同的请求
-      无法复用相同 chunk 的 KV。内容寻址的命中率更高。
+    模拟 vLLM Scheduler 的链式块哈希计算（对齐 vLLM SHA256 实现）。
+    真实系统中由 vLLM 计算，通过 connector_metadata 传给 LMCache。
     """
 
-    def __init__(self, chunk_size: int = 256):
-        self.chunk_size = chunk_size
+    def __init__(self, block_size: int = 16):
+        self.block_size = block_size
 
-    def get_keys(self, token_ids: list[int], prefix: str = "") -> list[str]:
-        """为 token_ids 的每个完整 chunk 生成存储 key"""
-        keys = []
-        for chunk_idx, i in enumerate(
-            range(0, len(token_ids) - self.chunk_size + 1, self.chunk_size)
-        ):
-            chunk = token_ids[i:i + self.chunk_size]
-            content_hash = hashlib.sha256(
-                np.array(chunk, dtype=np.int32).tobytes()
-            ).hexdigest()[:16]
-            # chunk_idx 编入 key：相同内容在不同位置的 KV 值因 RoPE 而不同，
-            # 必须区分；不能只用 content_hash。
-            key = f"{prefix}/blk{chunk_idx}/{content_hash}"
-            keys.append(key)
-        return keys
+    def compute_block_hashes(self, token_ids: list[int]) -> list[int]:
+        """返回每个完整 block 的链式哈希（uint64）"""
+        prev = 0
+        hashes = []
+        for i in range(0, len(token_ids) - self.block_size + 1, self.block_size):
+            chunk = token_ids[i : i + self.block_size]
+            # 链式：sha256(prev_hash ‖ token_ids)，取前 8 字节为 uint64
+            data = struct.pack(">Q", prev) + np.array(chunk, dtype=np.int32).tobytes()
+            prev = int.from_bytes(hashlib.sha256(data).digest()[:8], "big")
+            hashes.append(prev)
+        return hashes
 
-    def count_matched(self, token_ids: list[int], client: "MinimalMooncakeClient",
-                      prefix: str = "") -> int:
-        """返回从头开始连续命中的 chunk 数量"""
-        keys = self.get_keys(token_ids, prefix)
-        for i, key in enumerate(keys):
-            if not client.exists(key):
-                return i    # 前 i 个连续命中
-        return len(keys)    # 全部命中
+
+def make_lmcache_key(
+    model_name: str, world_size: int, worker_id: int,
+    block_hash: int, layer_name: str
+) -> str:
+    """
+    LMCache 实际存储键格式（对齐 LMCache 源码 storage_backend/connector/）：
+      vllm@{model}@{world_size}@{worker_id}@{block_hash:016x}@{layer_name}
+    """
+    return f"vllm@{model_name}@{world_size}@{worker_id}@{block_hash:016x}@{layer_name}"
 ```
+
+---
 
 **Step 3：Prefiller 侧连接器（save_kv_layer）**
 
 ```python
 # minimal/prefill_connector.py
 import torch
-from .chunked_token_db import ChunkedTokenDatabase
+from .block_hasher import VLLMBlockHasher, make_lmcache_key
 from .mooncake_client import MinimalMooncakeClient
 
 class MinimalPrefillConnector:
     """
     Prefiller 侧：逐层把 KV 写入 MooncakeStore。
     对应 LMCacheConnectorV1 的 save_kv_layer + wait_for_save。
+
+    真实 LMCache：block_hashes 由 attn_metadata 携带（vLLM 预计算）。
+    此处用 VLLMBlockHasher 模拟，演示键构造逻辑。
     """
 
-    def __init__(self, client: MinimalMooncakeClient, chunk_size: int = 256):
-        self.client   = client
-        self.chunk_db = ChunkedTokenDatabase(chunk_size)
-        self.model_prefix = "mymodel"
+    def __init__(self, client: MinimalMooncakeClient,
+                 model_name: str, block_size: int = 16):
+        self.client     = client
+        self.model_name = model_name.replace("/", "_")
+        self.hasher     = VLLMBlockHasher(block_size)
 
     def save_kv_layer(
         self,
-        layer_idx: int,
-        kv_layer: torch.Tensor,   # shape: [2, num_tokens, num_heads, head_dim]
-        token_ids: list[int],
+        layer_name: str,               # 如 "model.layers.0"
+        kv_layer: torch.Tensor,        # shape: [2, num_tokens, num_heads, head_dim]
+        block_hashes: list[int],       # vLLM 链式哈希，由 attn_metadata 携带
     ) -> None:
-        """把当前层的 KV 数据写入 MooncakeStore（按 chunk 分割存储）"""
-        keys = self.chunk_db.get_keys(token_ids, prefix=self.model_prefix)
-        chunk_size = self.chunk_db.chunk_size
+        """按 block 把当前层 KV 写入 MooncakeStore"""
+        block_size = kv_layer.shape[1] // len(block_hashes)
 
-        for chunk_idx, base_key in enumerate(keys):
-            # 提取该 chunk 对应的 KV 数据
-            start = chunk_idx * chunk_size
-            end   = start + chunk_size
-            kv_chunk = kv_layer[:, start:end, :, :]  # [2, chunk_size, heads, dim]
+        for blk_idx, blk_hash in enumerate(block_hashes):
+            start = blk_idx * block_size
+            end   = start + block_size
+            kv_chunk = kv_layer[:, start:end, :, :]   # [2, block_size, heads, dim]
 
-            # 生成包含层信息的存储 key
-            layer_key = f"{base_key}/layer{layer_idx}"
-
-            # 序列化并写入（不阻塞）
+            key      = make_lmcache_key("1", 1, 0, blk_hash, layer_name)
             kv_bytes = kv_chunk.cpu().numpy().tobytes()
-            self.client.put(layer_key, kv_bytes)
+            self.client.put(key, kv_bytes)
 
     def wait_for_save(self) -> None:
-        """等待所有异步写入完成（简化版：put 是同步的，无需等待）"""
+        """等待所有异步写入完成（简化版同步 put，无需等待）"""
         pass
 ```
+
+---
 
 **Step 4：Decoder 侧连接器（start_load_kv + wait_for_layer_load）**
 
 ```python
 # minimal/decode_connector.py
 import threading, torch
-from .chunked_token_db import ChunkedTokenDatabase
+from .block_hasher import make_lmcache_key
 from .mooncake_client import MinimalMooncakeClient
 
 class MinimalDecodeConnector:
     """
-    Decoder 侧：从 MooncakeStore 加载 KV，按层写入 paged KV buffer。
+    Decoder 侧：从 MooncakeStore 异步加载 KV，按层写入 paged KV buffer。
     对应 LMCacheConnectorV1 的 start_load_kv + wait_for_layer_load。
+
+    block_hashes 来自 scheduler_output.connector_metadata（vLLM 预计算，
+    经 build_connector_meta → scheduler_output 流转到 worker 侧）。
     """
 
     def __init__(self, client: MinimalMooncakeClient,
-                 kv_caches: list[torch.Tensor], chunk_size: int = 256):
-        self.client    = client
-        self.kv_caches = kv_caches
-        self.chunk_db  = ChunkedTokenDatabase(chunk_size)
-        self.model_prefix = "mymodel"
-        # 每层一个 Event，等待该层加载完成
-        self._layer_events: dict[int, threading.Event] = {}
+                 kv_caches: list[torch.Tensor]):
+        self.client     = client
+        self.kv_caches  = kv_caches
+        self._layer_events: dict[str, threading.Event] = {}
 
-    def get_num_matched_tokens(self, token_ids: list[int]) -> int:
-        """查询有多少 token 的 KV 已在 MooncakeStore 中（前缀连续命中）"""
-        matched_chunks = self.chunk_db.count_matched(
-            token_ids, self.client, prefix=self.model_prefix
-        )
-        return matched_chunks * self.chunk_db.chunk_size
-
-    def start_load_kv(self, token_ids: list[int], block_ids: list[int]) -> None:
-        """
-        异步触发从 MooncakeStore 加载 KV 到 vLLM paged KV buffer。
-        每层启动一个后台线程并行拉取。
-        """
-        keys = self.chunk_db.get_keys(token_ids, prefix=self.model_prefix)
-        num_layers = len(self.kv_caches)
-
-        for layer_idx in range(num_layers):
+    def start_load_kv(
+        self,
+        block_hashes: list[int],   # vLLM 链式哈希列表（每个 block 一个）
+        block_ids:    list[int],   # 对应 vLLM paged KV buffer 中的物理 block id
+        layer_names:  list[str],   # 所有层名称列表
+    ) -> None:
+        """为每层启动后台线程，并行从 MooncakeStore 拉取 KV"""
+        for layer_name in layer_names:
             ev = threading.Event()
-            self._layer_events[layer_idx] = ev
+            self._layer_events[layer_name] = ev
 
-            def _load_layer(lidx=layer_idx, ev=ev):
-                kv_cache = self.kv_caches[lidx]
-                for chunk_idx, base_key in enumerate(keys):
-                    layer_key = f"{base_key}/layer{lidx}"
-                    kv_bytes  = self.client.get(layer_key)
+            def _load(lname=layer_name, ev=ev):
+                layer_idx = layer_names.index(lname)
+                kv_cache  = self.kv_caches[layer_idx]
+                for blk_idx, (blk_hash, blk_id) in enumerate(
+                    zip(block_hashes, block_ids)
+                ):
+                    key      = make_lmcache_key("1", 1, 0, blk_hash, lname)
+                    kv_bytes = self.client.get(key)
                     if kv_bytes is None:
                         continue
-                    # 把数据写入 paged KV buffer 的对应 block
-                    block_id = block_ids[chunk_idx]
+                    # 写入 paged KV buffer 的对应物理 block
                     kv_tensor = torch.frombuffer(kv_bytes, dtype=kv_cache.dtype)
                     kv_tensor = kv_tensor.reshape(2, -1, *kv_cache.shape[2:])
-                    kv_cache[0, block_id] = kv_tensor[0]  # key
-                    kv_cache[1, block_id] = kv_tensor[1]  # value
+                    kv_cache[0, blk_id] = kv_tensor[0]   # key cache
+                    kv_cache[1, blk_id] = kv_tensor[1]   # value cache
                 ev.set()
 
-            threading.Thread(target=_load_layer, daemon=True).start()
+            threading.Thread(target=_load, daemon=True).start()
 
-    def wait_for_layer_load(self, layer_idx: int) -> None:
-        """等待指定层的 KV 加载完成（在该层 Attention 执行前调用）"""
-        ev = self._layer_events.pop(layer_idx, None)
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        """等待指定层 KV 加载完成（在该层 Attention 执行前调用）"""
+        ev = self._layer_events.pop(layer_name, None)
         if ev:
             ev.wait()
 ```
+
+---
 
 **Step 5：组装 vLLM V1 Connector（胶水层）**
 
 ```python
 # minimal/lmcache_connector.py
+import os, json, threading
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+from .block_hasher import VLLMBlockHasher, make_lmcache_key
+from .mooncake_client import MinimalMooncakeClient
+from .decode_connector import MinimalDecodeConnector
+from .prefill_connector import MinimalPrefillConnector
 
 class MinimalLMCacheConnector(KVConnectorBase_V1):
-    """
-    精简版 LMCacheConnectorV1，使用 MooncakeStore 作为后端。
-    """
+    """精简版 LMCacheConnectorV1，对齐真实 LMCache 的调用路径"""
 
     def __init__(self, vllm_config, role):
         super().__init__(vllm_config, role)
-        from .mooncake_client import MinimalMooncakeClient
         cfg = json.load(open(os.environ["LMCACHE_CONFIG_FILE"]))
-        self.client = MinimalMooncakeClient(cfg.get("extra_config", {}))
-        self.chunk_db = ChunkedTokenDatabase(cfg.get("chunk_size", 256))
-        self.model_prefix = vllm_config.model_config.model.replace("/", "_")
-        self._load_events: dict[str, threading.Event] = {}
+        self.client      = MinimalMooncakeClient(cfg.get("extra_config", {}))
+        self.block_size  = vllm_config.cache_config.block_size  # 与 vLLM block 对齐
+        self.hasher      = VLLMBlockHasher(self.block_size)
+        self.model_name  = vllm_config.model_config.model.replace("/", "_")
+        self._load_connector: MinimalDecodeConnector | None = None
 
     # ── Scheduler 侧 ─────────────────────────────────────────────
-    def get_num_new_matched_tokens(self, request, num_computed_tokens):
-        token_ids = request.inputs.prompt_token_ids
-        matched_chunks = self.chunk_db.count_matched(
-            token_ids, self.client, self.model_prefix
-        )
-        n = matched_chunks * self.chunk_db.chunk_size - num_computed_tokens
-        return max(n, 0), n > 0
+
+    def get_num_new_matched_tokens(
+        self, request, num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        """
+        查询 MooncakeStore 中已有多少连续 block 命中。
+        真实 LMCache：直接使用 request 携带的 vLLM block_hashes 逐个查 exists()。
+        此处用模拟 hasher 替代（逻辑等价）。
+        """
+        token_ids    = request.inputs.prompt_token_ids
+        block_hashes = self.hasher.compute_block_hashes(token_ids)
+
+        matched = 0
+        for blk_hash in block_hashes:
+            # 只要第 0 层存在，认为整个 block 已缓存（简化：真实 LMCache 检查所有层）
+            probe_key = make_lmcache_key(self.model_name, 1, 0, blk_hash, "layer.0")
+            if not self.client.exists(probe_key):
+                break
+            matched += 1
+
+        new_tokens = matched * self.block_size - num_computed_tokens
+        return max(new_tokens, 0), new_tokens > 0
 
     def update_state_after_alloc(self, request, blocks, num_lookahead_slots):
-        pass  # LMCache 不需要在分配后更新状态
+        pass
 
     def build_connector_meta(self, request):
-        token_ids = request.inputs.prompt_token_ids
-        keys = self.chunk_db.get_keys(token_ids, self.model_prefix)
-        return {"keys": keys, "req_id": request.request_id,
-                "block_ids": request.get_block_ids()}
+        """把 block_hashes 和 block_ids 打包，随 scheduler_output 流转到 worker 侧"""
+        token_ids    = request.inputs.prompt_token_ids
+        block_hashes = self.hasher.compute_block_hashes(token_ids)
+        return {
+            "block_hashes": block_hashes,
+            "block_ids":    request.get_block_ids(),
+        }
 
     def request_finished(self, request, block_ids, success):
-        return False, None  # 不需要延迟释放
+        return False, None   # LMCache 无需 delay_free
 
     def take_events(self):
         return []
 
     # ── Worker 侧 ─────────────────────────────────────────────────
+
     def register_kv_caches(self, kv_caches):
-        self.kv_caches = kv_caches
+        self.kv_caches  = kv_caches
+        self.layer_names = [f"model.layers.{i}" for i in range(len(kv_caches))]
+
+    def save_kv_layer(self, layer_name: str, kv_layer, attn_metadata, **kwargs):
+        """
+        Prefiller 侧：把当前层 KV 写入 MooncakeStore。
+        真实 LMCache：block_hashes 从 attn_metadata 取得（vLLM 预计算）。
+        """
+        token_ids    = attn_metadata.seq_groups[0].get_token_ids()   # 简化取法
+        block_hashes = self.hasher.compute_block_hashes(token_ids)
+        connector    = MinimalPrefillConnector(
+            self.client, self.model_name, self.block_size
+        )
+        connector.save_kv_layer(layer_name, kv_layer, block_hashes)
+
+    def wait_for_save(self):
+        pass   # 真实 LMCache：等待后台异步 put 线程池完成
 
     def start_load_kv(self, scheduler_output, finished_reqs):
+        """Decoder 侧：从 scheduler_output.connector_metadata 取 block_hashes，启动异步加载"""
         meta = scheduler_output.connector_metadata
         if not meta:
             return
-        connector = MinimalDecodeConnector(
-            self.client, self.kv_caches, self.chunk_db.chunk_size
+        self._load_connector = MinimalDecodeConnector(self.client, self.kv_caches)
+        self._load_connector.start_load_kv(
+            block_hashes = meta["block_hashes"],
+            block_ids    = meta["block_ids"],
+            layer_names  = self.layer_names,
         )
-        connector.start_load_kv(
-            token_ids=meta["keys"],  # simplified
-            block_ids=meta["block_ids"]
-        )
-        self._load_connector = connector
 
-    def wait_for_layer_load(self, layer_name):
-        layer_idx = int(layer_name.split(".")[-1])
-        if hasattr(self, "_load_connector"):
-            self._load_connector.wait_for_layer_load(layer_idx)
-
-    def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
-        # Prefiller 侧：异步写入 MooncakeStore
-        layer_idx = int(layer_name.split(".")[-1])
-        # 实际实现会从 attn_metadata 中获取 token_ids
-        pass
-
-    def wait_for_save(self):
-        pass  # 实际实现等待所有异步 put 完成
+    def wait_for_layer_load(self, layer_name: str):
+        if self._load_connector:
+            self._load_connector.wait_for_layer_load(layer_name)
 
     def get_finished(self, finished_req_ids):
         return [], []
